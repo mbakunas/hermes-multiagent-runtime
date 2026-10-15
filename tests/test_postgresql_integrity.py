@@ -1,28 +1,6 @@
-from os import environ
-from pathlib import Path
-
 import pytest
-from alembic import command
-from alembic.config import Config
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.pool import NullPool
-
-
-@pytest.fixture(scope="module")
-def engine():
-    url = environ.get("HERMES_TEST_DATABASE_URL")
-    if not url:
-        pytest.skip("Set HERMES_TEST_DATABASE_URL to an empty disposable PostgreSQL 17+ database")
-    database = create_engine(url, poolclass=NullPool, hide_parameters=True)
-    with database.begin() as connection:
-        if connection.scalar(text("SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")):
-            raise RuntimeError("Database integration tests require an empty disposable database")
-        config = Config(str(Path(__file__).parents[1] / "src/hermes_coordination/storage/migrations/alembic.ini"))
-        config.attributes["connection"] = connection
-        command.upgrade(config, "head")
-    yield database
-    database.dispose()
 
 
 @pytest.fixture
@@ -36,7 +14,7 @@ def connection(engine):
             transaction.rollback()
 
 
-def seed_task(connection):
+def seed_task(connection, *, node=None, create_instance=True):
     actor = connection.scalar(text("SELECT public.hermes_actor()"))
     artifact = connection.scalar(text("""
         INSERT INTO artifact_metadata(uploader_identity, artifact_kind, media_type, byte_size, checksum_digest,
@@ -56,48 +34,55 @@ def seed_task(connection):
         INSERT INTO tasks(workflow_id, specification_revision, output_contract, state)
         VALUES (:workflow, 'v1', '{}', 'ready') RETURNING id
     """), {"workflow": workflow})
-    node = connection.scalar(text("""
-        INSERT INTO nodes(name, enrollment_identity, desired_state)
-        VALUES (gen_random_uuid()::text, gen_random_uuid()::text, 'enabled') RETURNING id
-    """))
+    if node is None:
+        node = connection.scalar(text("""
+            INSERT INTO nodes(name, enrollment_identity, desired_state)
+            VALUES (gen_random_uuid()::text, gen_random_uuid()::text, 'enabled') RETURNING id
+        """))
     agent = connection.scalar(text("""
         INSERT INTO agents(name, role, desired_state, approved_profile_revision)
         VALUES (gen_random_uuid()::text, 'researcher', 'enabled', 'verified') RETURNING id
     """))
-    instance = connection.scalar(text("""
-        INSERT INTO agent_instances(agent_id, node_id, hermes_version, verified_profile_digest, state, readiness)
-        VALUES (:agent, :node, 'pinned', 'verified', 'ready', 'ready') RETURNING id
-    """), {"agent": agent, "node": node})
+    instance = None
+    if create_instance:
+        instance = connection.scalar(text("""
+            INSERT INTO agent_instances(agent_id, node_id, hermes_version, verified_profile_digest, state, readiness)
+            VALUES (:agent, :node, 'pinned', 'verified', 'ready', 'ready') RETURNING id
+        """), {"agent": agent, "node": node})
     return {"actor": actor, "artifact": artifact, "request": request, "workflow": workflow,
             "task": task, "node": node, "agent": agent, "instance": instance}
 
 
-def seed_assignment(connection, records):
+def seed_assignment(connection, records, *, attempt_number=1):
     assignment = connection.scalar(text("""
         INSERT INTO assignments(task_id, instance_id, authoritative_assigner, selection_rationale, capability_snapshot)
         VALUES (:task, :instance, :actor, 'test', '[]') RETURNING id
     """), records)
     attempt = connection.execute(text("""
         INSERT INTO task_attempts(task_id, assignment_id, attempt_number, lease_expires_at)
-        VALUES (:task, :assignment, 1, CURRENT_TIMESTAMP + interval '60 seconds')
+        VALUES (:task, :assignment, :attempt_number, CURRENT_TIMESTAMP + interval '60 seconds')
         RETURNING id, ownership_token
-    """), {**records, "assignment": assignment}).one()
+    """), {**records, "assignment": assignment, "attempt_number": attempt_number}).one()
     connection.execute(text("UPDATE tasks SET state = 'assigned', current_attempt_id = :attempt WHERE id = :task"),
                        {"attempt": attempt.id, "task": records["task"]})
     connection.exec_driver_sql("SET CONSTRAINTS ALL IMMEDIATE")
     return assignment, attempt
 
 
-def assert_rejected(connection, statement, parameters=None):
-    with pytest.raises(DBAPIError):
+def assert_rejected(connection, statement, parameters=None, *, sqlstate="P0001"):
+    with pytest.raises(DBAPIError) as error:
         with connection.begin_nested():
             connection.execute(text(statement), parameters or {})
             connection.exec_driver_sql("SET CONSTRAINTS ALL IMMEDIATE")
+    assert error.value.orig.sqlstate == sqlstate
 
 
 def test_all_tables_enums_and_capabilities_created(connection):
     assert connection.scalar(text("SELECT count(*) FROM capability_definitions")) == 19
-    assert connection.scalar(text("SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")) == 33
+    assert connection.scalar(text("""
+        SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace
+            AND relkind IN ('r','p') AND NOT relispartition
+    """)) == 34
     assert connection.scalar(text("SELECT count(*) FROM pg_type WHERE typname = 'TaskState'")) == 1
 
 
@@ -113,15 +98,15 @@ def test_authority_privileges(connection):
 def test_primary_keys_and_history_cannot_change(connection):
     records = seed_task(connection)
     assert_rejected(connection, "UPDATE nodes SET id = gen_random_uuid() WHERE id = :node", records)
-    assert_rejected(connection, "DELETE FROM tasks WHERE id = :task", records)
-    assert_rejected(connection, "TRUNCATE audit_events")
+    assert_rejected(connection, "DELETE FROM tasks WHERE id = :task", records, sqlstate="42501")
+    assert_rejected(connection, "TRUNCATE audit_events", sqlstate="42501")
     assert_rejected(connection, "UPDATE audit_events SET action = 'rewritten'")
 
 
 def test_bounded_json_and_foreign_keys(connection):
     records = seed_task(connection)
-    assert_rejected(connection, "UPDATE nodes SET metadata_json = jsonb_build_object('oversized',repeat('x',65537)) WHERE id = :node", records)
-    assert_rejected(connection, "INSERT INTO workflows(request_id, policy_revision) VALUES (gen_random_uuid(),'v1')")
+    assert_rejected(connection, "UPDATE nodes SET metadata_json = jsonb_build_object('oversized',repeat('x',65537)) WHERE id = :node", records, sqlstate="23514")
+    assert_rejected(connection, "INSERT INTO workflows(request_id, policy_revision) VALUES (gen_random_uuid(),'v1')", sqlstate="23503")
 
 
 def test_single_active_incarnation(connection):
@@ -129,7 +114,7 @@ def test_single_active_incarnation(connection):
     assert_rejected(connection, """
         INSERT INTO agent_instances(agent_id, node_id, hermes_version, verified_profile_digest, state, readiness)
         VALUES (:agent, :node, 'pinned', 'verified', 'ready', 'ready')
-    """, records)
+    """, records, sqlstate="23505")
 
 
 def test_single_active_assignment_and_attempt_binding(connection):
@@ -139,12 +124,12 @@ def test_single_active_assignment_and_attempt_binding(connection):
         INSERT INTO assignments(task_id, instance_id, authoritative_assigner, selection_rationale, capability_snapshot)
         VALUES (:task, :instance, :actor, 'duplicate', '[]')
     """, records)
-    assert_rejected(connection, "UPDATE tasks SET current_attempt_id = gen_random_uuid() WHERE id = :task", records)
+    assert_rejected(connection, "UPDATE tasks SET current_attempt_id = gen_random_uuid() WHERE id = :task", records, sqlstate="23503")
     assert_rejected(connection, """
         INSERT INTO task_attempts(task_id, assignment_id, attempt_number, lease_expires_at)
         VALUES (:task, :assignment, 1, CURRENT_TIMESTAMP + interval '60 seconds')
-    """, {**records, "assignment": assignment})
-    assert_rejected(connection, "SELECT public.hermes_claim_attempt(:attempt, NULL, 60)", {"attempt": attempt.id})
+    """, {**records, "assignment": assignment}, sqlstate="23505")
+    assert_rejected(connection, "SELECT public.hermes_claim_attempt(:attempt, NULL, 60)", {"attempt": attempt.id}, sqlstate="42501")
 
 
 def test_dependencies_are_acyclic_and_same_workflow(connection):
@@ -217,7 +202,7 @@ def test_approval_requires_durable_unique_revision_decision(connection):
     assert_rejected(connection, """
         INSERT INTO approval_decisions(request_id,request_revision,authenticated_user,decision,reason,idempotency_key)
         VALUES (:approval,1,:user,'reject','conflicting',gen_random_uuid()::text)
-    """, records)
+    """, records, sqlstate="23505")
     connection.execute(text("UPDATE approval_requests SET state='approved' WHERE id=:approval"), records)
     assert_rejected(connection, "UPDATE approval_requests SET action_specification='{\"action\":\"delete\"}' WHERE id=:approval", records)
     assert_rejected(connection, """

@@ -5,11 +5,11 @@ from sqlalchemy import ForeignKey, ForeignKeyConstraint, Index, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .base import Base, CreatedMixin, IdentityMixin, bounded_json, enum_type
+from .base import Base, EventIdentityMixin, bounded_json, enum_type
 from .enums import TaskState
 
 
-class AuditEvent(IdentityMixin, CreatedMixin, Base):
+class AuditEvent(EventIdentityMixin, Base):
     __tablename__ = "audit_events"
     __table_args__ = (
         ForeignKeyConstraint(["entity_id", "entity_type"],
@@ -17,6 +17,7 @@ class AuditEvent(IdentityMixin, CreatedMixin, Base):
         bounded_json("payload"),
         Index("ix_audit_events_entity", "entity_id", "created_at"),
         Index("ix_audit_events_correlation_id", "correlation_id"),
+        {"postgresql_partition_by": "RANGE (created_at)"},
     )
 
     entity_type: Mapped[str] = mapped_column(String(63))
@@ -34,8 +35,9 @@ class AuditEvent(IdentityMixin, CreatedMixin, Base):
     )
 
 
-class TaskEvent(IdentityMixin, CreatedMixin, Base):
+class TaskEvent(EventIdentityMixin, Base):
     __tablename__ = "task_events"
+    __table_args__ = {"postgresql_partition_by": "RANGE (created_at)"}
 
     task_id: Mapped[UUIDValue] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="RESTRICT"), index=True

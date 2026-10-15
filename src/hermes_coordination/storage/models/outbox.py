@@ -6,11 +6,11 @@ from sqlalchemy import CheckConstraint, DateTime, ForeignKeyConstraint, Index, S
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .base import Base, CreatedMixin, IdentityMixin, bounded_json, enum_type
+from .base import Base, EventIdentityMixin, bounded_json, enum_type
 from .enums import OutboxPublicationStatus
 
 
-class OutboxEvent(IdentityMixin, CreatedMixin, Base):
+class OutboxEvent(EventIdentityMixin, Base):
     __tablename__ = "outbox_events"
     __table_args__ = (
         ForeignKeyConstraint(["entity_id", "entity_type"],
@@ -28,6 +28,7 @@ class OutboxEvent(IdentityMixin, CreatedMixin, Base):
         Index("ix_outbox_events_pending", "retry_at", "created_at",
               postgresql_where=text("publication_status <> 'published'")),
         Index("ix_outbox_events_publisher_lease_expires_at", "publisher_lease_expires_at"),
+        {"postgresql_partition_by": "RANGE (created_at)"},
     )
 
     entity_id: Mapped[UUIDValue] = mapped_column(UUID(as_uuid=True))

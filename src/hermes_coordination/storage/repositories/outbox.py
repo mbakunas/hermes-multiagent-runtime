@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import func, literal, or_, select, text, update
+from sqlalchemy import func, literal, or_, select, text, tuple_, update
 from sqlalchemy.orm import Session
 
 from ..models import OutboxEvent
@@ -16,13 +16,15 @@ class OutboxRepository(Repository[OutboxEvent]):
     def lease(self, *, limit: int = 100, lease_seconds: int = 30) -> Sequence[OutboxEvent]:
         if not 1 <= limit <= 1000 or not 1 <= lease_seconds <= 3600:
             raise ValueError("Invalid outbox batch or lease size")
-        candidates = select(OutboxEvent.id).where(or_(
+        candidates = select(OutboxEvent.id, OutboxEvent.created_at).where(or_(
             (OutboxEvent.publication_status == OutboxPublicationStatus.PENDING)
             & (OutboxEvent.retry_at <= func.current_timestamp()),
             (OutboxEvent.publication_status == OutboxPublicationStatus.PUBLISHING)
             & (OutboxEvent.publisher_lease_expires_at <= func.clock_timestamp()),
         )).order_by(OutboxEvent.retry_at, OutboxEvent.created_at).limit(limit).with_for_update(skip_locked=True).cte("candidates")
-        statement = update(OutboxEvent).where(OutboxEvent.id.in_(select(candidates.c.id))).values(
+        statement = update(OutboxEvent).where(
+            tuple_(OutboxEvent.id, OutboxEvent.created_at).in_(select(candidates.c.id, candidates.c.created_at))
+        ).values(
             publication_status=OutboxPublicationStatus.PUBLISHING,
             publisher_lease=func.gen_random_uuid(),
             publisher_lease_expires_at=func.current_timestamp() + literal(lease_seconds) * text("INTERVAL '1 second'"),

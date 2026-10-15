@@ -6,12 +6,13 @@ Target: Python 3.13, PostgreSQL 17+, SQLAlchemy 2.0 typed ORM, Alembic, and psyc
 
 ## Implementation Layout
 
-- [Models](../src/hermes_coordination/storage/models/__init__.py): all 25 requested first-class tables, plus seven integrity-support tables, for 32 domain tables total.
+- [Models](../src/hermes_coordination/storage/models/__init__.py): all 25 requested first-class tables, plus eight integrity-support tables, for 33 domain tables total (excluding physical event partitions).
 - [Enums](../src/hermes_coordination/storage/models/enums.py): the required enums plus role, dependency, decision, effect, and execution enums.
 - [Initial migration](../src/hermes_coordination/storage/migrations/versions/initial_schema.py): frozen definitions, all foreign keys/indexes, pgcrypto, role grants, guards, ownership functions, audit/outbox triggers, and the 19 initial capability definitions.
+- [Critical-review migration](../src/hermes_coordination/storage/migrations/versions/critical_review.py): task/action approvals, event retention and partitioning, liveness audit suppression, and authorized agent placements. The initial revision remains frozen.
 - [Database configuration](../src/hermes_coordination/storage/db.py): UTC sessions, PostgreSQL version validation, bounded pools/timeouts, and caller-owned transactions.
 - [Repositories](../src/hermes_coordination/storage/repositories/__init__.py): SQLAlchemy 2 persistence queries and guarded database calls; no implicit commits, task selection policy, retry scheduling, or destructive delete API.
-- [Contract tests](../tests/test_schema_contracts.py) and [database tests](../tests/test_postgresql_integrity.py): deployment-side validation, not executed on the development workstation.
+- [Contract tests](../tests/test_schema_contracts.py), [database tests](../tests/test_postgresql_integrity.py), and [service workflows](../tests/test_service_workflows.py): validation-host tests, also configured in [PostgreSQL 17 CI](../.github/workflows/postgresql.yml). No local workstation environment is required.
 
 ## Deployment And Validation
 
@@ -31,10 +32,10 @@ The initial revision assumes a dedicated database whose `public` schema has no c
 Set `HERMES_TEST_DATABASE_URL` to an **empty disposable PostgreSQL 17+ database**, using a migration-capable owner, then run:
 
 ```sh
-python -m pytest tests/test_postgresql_integrity.py
+python -m pytest -q
 ```
 
-Integration tests refuse a nonempty public schema, install the initial migration, and roll back individual test data. They leave the disposable schema installed and do not execute a destructive downgrade. PostgreSQL roles are cluster-wide and are intentionally not dropped by tests. Use a dedicated validation cluster/database and do not use production credentials or data. These tests are a baseline; real service-login ownership and concurrent failover tests remain deployment release gates.
+Integration tests refuse a nonempty public schema, install the initial revision, publish an event using the old audit mechanism, then upgrade to head. Integrity tests roll back their own data; service/concurrency tests commit isolated records and leave the disposable schema/data installed. No destructive downgrade is executed. Tests provision distinct ordinary LOGIN roles for node, intake, approval, outbox, Orchestrator, and admin services with generated disposable passwords, then drop those test logins at session teardown. The NOLOGIN group roles remain cluster-wide. Use a dedicated validation cluster/database, never production credentials or data. CI uses Python 3.13 and a real `postgres:17` service; integration tests fail instead of silently skipping when `CI` is set but the database URL is missing.
 
 The migration can emit offline SQL using Alembic's `upgrade head --sql` mode. Apply it transactionally as the migration owner. Destructive downgrade is intentionally prohibited; recovery restores a verified backup into a separate database. The migration contains frozen schema definitions and never imports live ORM models. The Alembic bookkeeping table is Alembic-managed and is not one of the domain UUID tables.
 
@@ -42,13 +43,13 @@ The migration can emit offline SQL using Alembic's `upgrade head --sql` mode. Ap
 
 Use `Database.transaction()` for short persistence transactions. Do not keep a transaction open while Hermes Agent executes, MQTT publishes, or NAS uploads occur. PostgreSQL generates lifecycle timestamps using `CURRENT_TIMESTAMP`; deadlines/availability and lease/retry offsets are scheduling data, computed using PostgreSQL expressions or supplied absolute UTC contract values, not Python clock calls. `clock_timestamp()` is used only for live expiry comparisons so a transaction-start timestamp cannot authorize an already-expired lease.
 
-Every domain primary key is `UUID(as_uuid=True)` with `gen_random_uuid()` as its server default. BEFORE triggers reject changes to primary keys. The entity registry is created transactionally by insertion triggers, is not directly writable by applications, and gives audit/outbox references a real foreign-key target and monotonically increasing entity version. It does not introduce another task store or authority.
+Coordination records have a `UUID(as_uuid=True)` primary key with `gen_random_uuid()` as its server default. Event tables instead have `(id, created_at)` primary keys because PostgreSQL requires a partitioned unique key to include its partition key; their UUID event IDs and envelopes are preserved. ORM identity lookups such as `Session.get(OutboxEvent, ...)` now require the composite identity; repository UUID lookup/acknowledgement APIs are unchanged. BEFORE triggers reject identity changes. The entity registry is created transactionally for coordination records only, is not directly writable by applications, and gives audit/outbox references a real FK target and increasing entity version. Events are not entities and never create registry rows.
 
-All foreign keys are `ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED`. This supports the task/current-attempt cycle and atomic assignment/completion transactions. Check and partial uniqueness constraints are immediate. Services must commit a coherent final state; deferred consistency triggers validate task/assignment/attempt alignment and proposal acceptance. No application role can delete or truncate domain history; append-only records also reject updates.
+All foreign keys are `ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED`. This supports the task/current-attempt cycle and atomic assignment/completion transactions. Check and partial uniqueness constraints are immediate. Services must commit a coherent final state; deferred consistency triggers validate task/assignment/attempt alignment and proposal acceptance. No application role has direct DELETE/TRUNCATE privileges; the only retention entry point is the admin-only audited event archival function described below. Append-only records still reject updates, including when reached through physical partitions.
 
 | Database group role | Write authority |
 | --- | --- |
-| `hermes_admin` | Provision nodes, agents, principals, capability definitions/inventories and approval policies; manage registry desired state, retire policies, and administer artifact retention metadata |
+| `hermes_admin` | Provision nodes, agents, principals, capabilities, approval policies and agent placements; enable/revoke placements, manage desired state, retire policies, administer artifact retention metadata, and execute audited event archival |
 | `hermes_orchestrator` | Create tasks/workflows, requirements/dependencies, assignments/attempts; decide proposals and link resulting tasks; reconcile approvals/effects |
 | `hermes_node` | No direct coordination table writes; execute owned claim/renew/completion, registration, heartbeat, execution, artifact, proposal, approval-request, and effect functions |
 | `hermes_intake` | Insert authenticated requests and verified external-input artifact metadata |
@@ -60,26 +61,44 @@ Provision a distinct ordinary LOGIN for each service/node, grant only its group 
 
 Trusted infrastructure logins can read coordination metadata; end-user and worker data scopes must still be enforced by their service/bridge. Workers never receive these credentials. The approval API must authenticate the human and verify `required_approver_role`; the database verifies the registered human FK, revision uniqueness, and durable state/action binding. A browser message or MQTT event is not a decision.
 
+Registration requires an enabled `agent_placements(agent_id, node_id)` record provisioned by an admin. Placement identity is immutable; update `enabled` to revoke or restore it. Registration locks the placement against concurrent revocation. No existing placement is automatically authorized during upgrade: admins must explicitly provision intended pairs before new instances register. Existing instances are preserved; revoking placement prevents subsequent registrations but does not terminate a running process. The profile digest is an integrity check, never a credential or placement authorization.
+
 Assignments require a ready task, enabled node/agent, ready instance, approved profile digest, and registered required capability IDs. In Phase 1, `approved_profile_revision` stores the approved profile digest used for exact registration/assignment verification; a friendly release label is not substituted for that digest. Complete version-constraint compatibility, heartbeat freshness, optional/preferred scoring, dependencies, quotas, and policy remain Orchestrator responsibilities. The repository `ready()` query is only a persistence candidate query, not a scheduler.
 
 One active incarnation is enforced for `registering`, `ready`, `draining`, and `suspect` instances, conservatively preventing restart overlap. Capacity is exactly one in Phase 1. One active assignment per task **and per instance**, plus one active attempt per task, enforce that slot. One assignment represents one attempt; a retry creates new records rather than reopening history.
 
 Ownership functions lock task, attempt, then assignment; validate current token, lease, assignment and node/instance; and conditionally mutate only that scope. Random UUID tokens are basic database fencing, not Phase 3 monotonic external-effect fencing. A sensitive effect requires a valid durable approval and live ownership. Unknown effects are reconciled, never redispatched automatically. Schema checks cannot prove a process stopped or an external effect did not occur.
 
-The node service must persist a stopped execution outcome before suspending its attempt for approval. Waiting approval closes that attempt/assignment. Continuation is an Orchestrator-created new attempt; old decisions do not implicitly transfer to it. A new action-bound approval request is required when rebinding to a new attempt. This package does not implement the continuation planner.
+The node service must persist a stopped execution outcome before suspending its attempt for approval. Waiting approval closes that attempt/assignment. Continuation is an Orchestrator-created new assignment/attempt on the same task. Authorization binds to `(approval_request_id, task_id, action_digest)`, so the continuation can use the existing durable decision for that exact action while the approval is unexpired, unrevoked, and its policy active. The request's original `attempt_id` remains immutable provenance, not a consumption restriction. Both effect preparation and dispatch still require the task's current live running attempt; node functions additionally validate its token and authenticated host. Different tasks or action digests cannot reuse the approval. Changed actions require new approval requests. This package does not implement the continuation planner.
 
 An approval service inserts `ApprovalDecisionRecord`, flushes, then changes the matching pending request to the appropriate state in the **same transaction**. The row lock serializes decisions with approval artifact binding and effects. Proposal acceptance likewise writes decision, generated tasks, links, and final accepted state in one transaction; a deferred trigger rejects acceptance without both decision and linked tasks.
 
-State-changing persistence automatically creates sanitized audit and outbox records in the same transaction. Audit payloads record changed column names and previous/new state rather than copying prompts or full contracts. Task changes also create task events. Outbox delivery transitions have their own append-only audit trigger, without recursively enqueueing more delivery events. The original outbox entity/envelope/topic are immutable; polling and lease recovery remain essential.
+State-changing persistence automatically creates sanitized audit and outbox records in the same transaction. Audit payloads record changed column names and previous/new state rather than copying prompts or full contracts. Task changes also create task events. Liveness-only updates (`last_heartbeat_at`, `lease_expires_at`, and accompanying `updated_at`) do not audit, publish, or increment registry versions. Liveness fields are excluded from audit column lists even on mixed updates. The existing liveness columns remain for compatibility; no heartbeat table is introduced. Outbox lease-only refresh/recovery likewise produces no audit. Publication status transitions audit the original coordination entity with the event UUID in the payload, without registering delivery events or recursively enqueueing more delivery events. Original outbox entity/envelope/topic content remains immutable.
+
+## Event Retention
+
+`audit_events`, `task_events`, and `outbox_events` are range-partitioned by `created_at` in UTC calendar months. The upgrade preserves existing UUIDs, timestamps, payloads, indexes, and coordination FKs, converts legacy publication audits to their original entity, and removes event identity registry rows/FKs. It rewrites event tables under migration-owner locks and needs a maintenance window and temporary disk headroom for a second copy. Custom legacy correlation/causation references to event registry rows must be reconciled before upgrade; coordination-entity references remain valid. An unsupported reference causes transactional upgrade failure, not silent history deletion.
+
+The migration creates monthly partitions covering existing history through twelve months ahead, plus a default partition so later writes do not fail. Schedule DBA partition maintenance before that horizon; if rows have reached the default partition, move those rows while attaching the relevant monthly partition under a maintenance window. Applications have grants on parent tables only. Do not grant services direct partition writes or disable triggers.
+
+After exporting/verifying the required history externally, an admin login may run, in its ordinary caller-owned transaction:
+
+```sql
+SELECT public.hermes_archive_events('2026-01-01T00:00:00Z'::timestamptz, 'Verified archival export reference');
+```
+
+The cutoff must be in the past and the reason nonempty. The function deletes older task/audit events and only **published** older outbox rows. Pending/publishing rows survive regardless of age. It returns per-table deletion counts and writes an `events.archived` audit with the actor, cutoff, reason, and counts in the same transaction. Concurrent archival calls serialize via an advisory lock. Failed or rolled-back archival restores both data and audit atomically. It does not export data, drop partition shells, or delete coordination records. Direct DELETE/TRUNCATE remains denied even to admin logins; setting the archival flag alone does not confer DELETE privileges. Trusted database owners remain outside the application security boundary.
 
 ## ERD
 
-Each table shown has an immutable UUID primary key. Every domain table except `coordination_entities` also has a PK-to-registry FK; those repetitive identity edges are summarized rather than drawn 31 times.
+Every coordination table except `coordination_entities` has a UUID PK-to-registry FK; repetitive identity edges are omitted below. The three event tables have composite `(id, created_at)` primary keys and no identity registry edges.
 
 ```mermaid
 erDiagram
     nodes ||--o{ principals : node_binding
     nodes ||--o{ agent_instances : hosts
+    nodes ||--o{ agent_placements : permits_hosting
+    agents ||--o{ agent_placements : authorized_locations
     agents ||--o{ agent_instances : incarnations
     agents ||--o{ requests : concierge
     principals ||--o{ requests : initiates
@@ -118,7 +137,7 @@ erDiagram
     principals ||--o{ proposal_decisions : reviews
     approval_policies ||--o{ approval_requests : policy_revision
     tasks ||--o{ approval_requests : action_task
-    task_attempts ||--o{ approval_requests : action_attempt
+    task_attempts ||--o{ approval_requests : requesting_attempt
     principals ||--o{ approval_requests : requests_approval
     approval_requests ||--o{ approval_request_artifacts : checksum_bindings
     artifact_metadata ||--o{ approval_request_artifacts : approved_bytes
@@ -144,12 +163,13 @@ erDiagram
 
 ## Index Inventory
 
-Every domain table has the primary-key index `pk_{table}`. Every UNIQUE constraint below also creates its PostgreSQL unique index. All additional indexes are listed here; comma-separated names on a row are independent indexes, not one composite index. The inventory utility prints exact PostgreSQL DDL including identifier truncation where necessary.
+Every domain table has the primary-key index `pk_{table}` (composite for event tables). Every UNIQUE constraint below also creates its PostgreSQL unique index. All additional indexes are listed here; comma-separated names on a row are independent indexes, not one composite index. Event parent indexes have corresponding physical partition indexes. The inventory utility prints exact PostgreSQL DDL including identifier truncation where necessary.
 
 | Table | Additional indexes |
 | --- | --- |
 | `coordination_entities`, `nodes`, `agents`, `capability_definitions`, `task_results`, `approval_policies` | No additional non-constraint indexes |
 | `principals` | `ix_principals_node_id` |
+| `agent_placements` | `ix_agent_placements_agent_id`, `ix_agent_placements_node_id` |
 | `agent_instances` | `ix_agent_instances_agent_id`, `ix_agent_instances_node_id`, `ix_agent_instances_eligibility(state, readiness, last_heartbeat_at)`; `uq_agent_instances_active_incarnation(agent_id)` WHERE state IN registering/ready/draining/suspect |
 | `instance_capabilities` | `ix_instance_capabilities_instance_id`, `ix_instance_capabilities_capability_id` |
 | `requests` | `ix_requests_authenticated_initiator`, `ix_requests_concierge_reference`, `ix_requests_intent_reference` |
@@ -178,7 +198,7 @@ Every domain table has the primary-key index `pk_{table}`. Every UNIQUE constrai
 
 ## Constraint Inventory
 
-Common to all domain tables: immutable UUID `pk_{table}`; NOT NULL as declared in the typed model/frozen migration; and, except the registry, `fk_{table}_id_coordination_entities`. All relationships listed in the ERD are backed by actual FKs. Foreign-key names use `fk_{table}_{first_local_column}_{parent}`, except `fk_tasks_current_attempt`. UNIQUE names use `uq_{table}_{all_columns}`; CHECK names use `ck_{table}_{label}`. Exact names/definitions are emitted by the inventory utility; no relationship relies on a JSON UUID array or string-based ORM join.
+Coordination tables have immutable UUID `pk_{table}` keys and, except the registry, `fk_{table}_id_coordination_entities`. Event tables instead use immutable `(id, created_at)` keys without identity registry FKs. NOT NULL follows the models/migrations. All ERD relationships are backed by actual FKs. Foreign-key names use `fk_{table}_{first_local_column}_{parent}`, except `fk_tasks_current_attempt`. UNIQUE names normally use `uq_{table}_{all_columns}`; the added approval key is explicitly `uq_approval_requests_task_action`. CHECK names use `ck_{table}_{label}`. Exact definitions are emitted by the inventory utility.
 
 ### All UNIQUE Constraints
 
@@ -188,6 +208,7 @@ Common to all domain tables: immutable UUID `pk_{table}`; NOT NULL as declared i
 | `principals` | `(subject)`, `(database_role)` |
 | `nodes` | `(name)`, `(enrollment_identity)` |
 | `agents` | `(name)` |
+| `agent_placements` | `(agent_id, node_id)` |
 | `agent_instances` | `(id, agent_id)` |
 | `capability_definitions` | `(canonical_name, contract_version)`, `(id, canonical_name)` |
 | `instance_capabilities` | `(instance_id, capability_id)` |
@@ -206,7 +227,7 @@ Common to all domain tables: immutable UUID `pk_{table}`; NOT NULL as declared i
 | `proposal_tasks` | `(proposal_id, task_id)` |
 | `proposal_decisions` | `(proposal_id, proposal_revision)` |
 | `approval_policies` | `(action_category, revision)`, `(id, revision)` |
-| `approval_requests` | `(id, revision)`, `(id, task_id, attempt_id, action_digest)` |
+| `approval_requests` | `(id, revision)`, `(id, task_id, attempt_id, action_digest)` (retained), `(id, task_id, action_digest)` |
 | `approval_request_artifacts` | `(request_id, artifact_id)` |
 | `approval_decisions` | `(request_id, request_revision)`, `(idempotency_key)` |
 | `effect_intents` | `(business_idempotency_key)` |
@@ -244,7 +265,7 @@ Other tables have no non-PK UNIQUE constraints. The four partial unique-index de
 - `approval_request_artifacts(artifact_id, checksum_digest) -> artifact_metadata(id, checksum_digest)`.
 - `approval_decisions(request_id, request_revision) -> approval_requests(id, revision)`.
 - `effect_intents(attempt_id, task_id) -> task_attempts(id, task_id)`.
-- `effect_intents(approval_request_id, task_id, attempt_id, action_digest) -> approval_requests(id, task_id, attempt_id, action_digest)`.
+- `effect_intents(approval_request_id, task_id, action_digest) -> approval_requests(id, task_id, action_digest)`.
 - `artifact_metadata(producing_attempt_id, producing_task_id) -> task_attempts(id, task_id)`.
 - `audit_events(entity_id, entity_type)` and `outbox_events(entity_id, entity_type) -> coordination_entities(id, entity_type)`.
 
@@ -253,12 +274,12 @@ All remaining FKs are single-column edges in the ERD, including task/attempt dir
 ### Trigger-Enforced Constraints
 
 - Identity/type immutability; database lifecycle timestamps; task/workflow optimistic version advancement; registry entity-version advancement.
-- No DELETE/TRUNCATE; append-only associations, verified inventory revisions, decisions, accepted results, task/audit events, and principal/capability definitions.
+- No direct DELETE/TRUNCATE; the admin-only audited event archival function is the sole application retention exception. Append-only associations, verified inventories, decisions, accepted results, task/audit events, and principal/capability definitions reject updates.
 - Sole Orchestrator assignment/proposal-decision authority and authenticated assigner matching.
 - Current assignment/task/attempt coherence at transaction end; no active assignment on a non-executable task.
 - Same-workflow dependency edges and serialized cycle rejection.
 - Frozen submitted proposals and decided approval artifact bindings; matching durable terminal proposal decisions and tasks on acceptance.
-- Current durable human decision before approval-state advancement; exact effect/task/attempt/digest binding, expiry checks, and protected artifact content/provenance after acceptance.
+- Current durable human decision before approval-state advancement; exact approval/task/action-digest binding and current live effect-attempt ownership, expiry checks, and protected artifact content/provenance after acceptance.
 - Terminal attempt history and ownership token immutability; sensitive effect binding and non-replayable status transitions.
 - Outbox envelope immutability; audit of publication transitions without recursive signaling.
 
@@ -273,6 +294,19 @@ All remaining FKs are single-column edges in the ERD, including task/attempt dir
 7. **Outbox recovery:** Added publisher lease expiry because a token alone cannot recover a crashed publisher. A database acknowledgement checks token and expiry; publication remains at least once. Envelope entity versions are database-ordered even for models without an optimistic ORM version column.
 8. **No destructive history:** Immutable inventory rows need a new agent incarnation/profile revision to advertise changed inventory; repositories do not replace/delete old rows. Audit records contain sanitized change metadata, not full historical contract snapshots. Services must use new task/proposal/policy revisions when preserving changed contract content is required.
 9. **State machines and services:** Database guards enforce key safety/immutability/ownership boundaries. Full scheduling, budgets, policy scope/approver-role evaluation, proposal semantic validation, NAS verification, and runtime stop confirmation belong to existing coordination services. No claim is made that generating this storage package implements those services.
-10. **Approval continuation:** Attempt-bound approval and closing ownership while waiting mean an approval cannot be silently reused on a retry/new attempt. Continuation must create a valid new binding and obtain required authorization; this remains explicit rather than weakening the frozen authority contract.
+10. **Approval continuation:** Review fix C1 separates requesting-attempt provenance from task/action authorization. A new live continuation attempt may consume the exact approved action without reopening the old attempt; expiry, revocation, policy activation, and business idempotency still apply.
 11. **Identity/authentication provisioning:** Login roles and user subjects are external authenticated identities; services must provision legitimate principals and enforce bridge scopes. PostgreSQL group-role names are cluster-wide. Approval-service credentials are a sensitive trust boundary and must not be exposed to agents or n8n workflows that can forge users.
-12. **Validation status:** Editor diagnostics/static file coverage are not import, migration, or PostgreSQL execution tests. The deployment tests included here must pass on Python 3.13/PostgreSQL 17+ before this implementation is considered production-verified. Additional real-login cross-node ownership, concurrent assignment/decision/cycle tests, crash recovery, and schema/permission inspection are required release gates.
+12. **Validation status:** Editor diagnostics are not import, migration, or PostgreSQL execution tests. The complete suite must pass on the validation computer/CI before this implementation is considered production-verified. C4 adds real-login happy paths for every node function and owned-write branch, live schema/permission inspection, SQLSTATE assertions, and concurrent publishers, assignments, lease-expiry/completion, and dependency cycles. Cross-host failover and external process/crash recovery remain deployment responsibilities.
+
+## Critical Review Summary
+
+Only C1-C4 are addressed; M1-M12 are intentionally out of scope.
+
+| Finding | Root cause | Solution | Regression coverage | Compatibility impact |
+| --- | --- | --- | --- | --- |
+| C1 | Authorization required the requesting attempt after that attempt was frozen in `waiting_approval`. | Bind approval to task/action digest; keep original attempt as provenance and require the current live effect attempt. | Real-node request, human decision, Orchestrator continuation, effect recording and dispatch; wrong digest/task, old token, revocation. | Function/repository signatures unchanged; new composite approval FK allows same-action continuation. |
+| C2 | Every heartbeat/renewal created audit/outbox and event-registry rows; immutable unpartitioned history had no retention path. | Suppress liveness audit/publication; remove event registration; monthly event partitions and privileged audited archival. | No audit/outbox/registry growth for heartbeat/renewal or publisher lease-only changes; populated upgrade, partition guards, archival privileges and pending-event preservation. | Liveness columns and UUID event envelopes retained; ORM event identity is now composite. History consumers must not expect heartbeat events or event registry rows. |
+| C3 | Any enrolled node knowing the profile digest could register any enabled agent. | Admin-managed audited placement allowlist checked under lock during registration; digest remains integrity-only. | Authorized registration; absent, foreign-node, revoked placements; denied node writes; wrong digest; placement auditing. | Administrators must explicitly provision placements before new registrations; existing instances stay intact. |
+| C4 | Optional owner-only rejection tests could pass for unrelated errors and never exercised real service ownership or races. | PostgreSQL 17 CI, distinct service LOGINs, exact SQLSTATE checks, complete node workflows and concurrent transactions. | Every node function/owned-write branch plus all four requested races. | No runtime service API changes; tests require a disposable migration-capable database and leave committed test history. |
+
+These changes were not executed against PostgreSQL on the development workstation. Passing validation-host/CI execution is a merge requirement, not a claimed result of editor checks.

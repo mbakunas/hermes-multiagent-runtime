@@ -38,6 +38,7 @@ class ApprovalRequest(IdentityMixin, TimestampMixin, Base):
                              ondelete="RESTRICT"),
         UniqueConstraint("id", "revision"),
         UniqueConstraint("id", "task_id", "attempt_id", "action_digest"),
+        UniqueConstraint("id", "task_id", "action_digest", name="uq_approval_requests_task_action"),
         CheckConstraint("revision > 0", name="revision"),
         CheckConstraint("action_digest ~ '^[0-9a-f]{64}$'", name="action_digest"),
         bounded_json("action_specification"),
@@ -106,8 +107,8 @@ class EffectIntent(IdentityMixin, TimestampMixin, Base):
     __table_args__ = (
         ForeignKeyConstraint(["attempt_id", "task_id"], ["task_attempts.id", "task_attempts.task_id"],
                              ondelete="RESTRICT"),
-        ForeignKeyConstraint(["approval_request_id", "task_id", "attempt_id", "action_digest"],
-                             ["approval_requests.id", "approval_requests.task_id", "approval_requests.attempt_id",
+        ForeignKeyConstraint(["approval_request_id", "task_id", "action_digest"],
+                     ["approval_requests.id", "approval_requests.task_id",
                               "approval_requests.action_digest"], ondelete="RESTRICT"),
         Index("ix_effect_intents_attempt_id", "attempt_id"),
         Index("ix_effect_intents_task_id", "task_id"),

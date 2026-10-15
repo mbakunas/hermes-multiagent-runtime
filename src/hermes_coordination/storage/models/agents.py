@@ -20,6 +20,19 @@ class Agent(IdentityMixin, TimestampMixin, Base):
     approved_profile_revision: Mapped[str] = mapped_column(String(128))
 
 
+class AgentPlacement(IdentityMixin, TimestampMixin, Base):
+    __tablename__ = "agent_placements"
+    __table_args__ = (UniqueConstraint("agent_id", "node_id"),)
+
+    agent_id: Mapped[UUIDValue] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="RESTRICT"), index=True
+    )
+    node_id: Mapped[UUIDValue] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("nodes.id", ondelete="RESTRICT"), index=True
+    )
+    enabled: Mapped[bool] = mapped_column(server_default=text("true"))
+
+
 class AgentInstance(IdentityMixin, TimestampMixin, Base):
     __tablename__ = "agent_instances"
     __table_args__ = (

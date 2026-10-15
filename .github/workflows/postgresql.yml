@@ -1,0 +1,38 @@
+name: PostgreSQL Integrity
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgresql-17:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: hermes-ci-only
+          POSTGRES_DB: hermes_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d hermes_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      HERMES_TEST_DATABASE_URL: postgresql+psycopg://postgres:hermes-ci-only@localhost:5432/hermes_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Run schema, service-login, and concurrency tests
+        run: python -m pytest -q

@@ -1,7 +1,7 @@
 from .base import Base
 from .identities import CoordinationEntity, Principal
 from .nodes import Node
-from .agents import Agent, AgentInstance
+from .agents import Agent, AgentInstance, AgentPlacement
 from .capabilities import CapabilityDefinition, InstanceCapability
 from .requests import Request
 from .workflows import Workflow
@@ -17,7 +17,7 @@ from .outbox import OutboxEvent
 
 
 __all__ = [
-    "Base", "CoordinationEntity", "Principal", "Node", "Agent", "AgentInstance",
+    "Base", "CoordinationEntity", "Principal", "Node", "Agent", "AgentInstance", "AgentPlacement",
     "CapabilityDefinition", "InstanceCapability", "Request", "Workflow", "Task",
     "TaskCapability", "TaskDependency", "TaskInputReference", "Assignment", "TaskAttempt",
     "ExecutionRun", "TaskResult", "TaskResultArtifact", "WorkProposal", "ProposalTask",

@@ -60,6 +60,15 @@ class CreatedMixin:
     )
 
 
+class EventIdentityMixin:
+    id: Mapped[UUIDValue] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
 class TimestampMixin(CreatedMixin):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"),
