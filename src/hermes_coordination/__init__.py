@@ -1,0 +1,1 @@
+"""Distributed coordination infrastructure; Hermes Agent owns execution."""
