@@ -1,7 +1,6 @@
 name: PostgreSQL Integrity
 
 on:
-  push:
   pull_request:
   workflow_dispatch:
 
