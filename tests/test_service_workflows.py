@@ -30,7 +30,10 @@ def node_task(engine, services):
     with engine.begin() as connection:
         records = seed_task(connection, node=services["node_id"], create_instance=False)
     with services["admin"].begin() as connection:
-        connection.execute(text("INSERT INTO agent_placements(agent_id,node_id) VALUES (:agent,:node)"), records)
+        connection.execute(text("""
+            INSERT INTO agent_placements(agent_id,node_id) VALUES (:agent,:node)
+            ON CONFLICT (agent_id,node_id) DO NOTHING
+        """), records)
     with services["node"].begin() as connection:
         records["instance"] = connection.scalar(text(
             "SELECT public.hermes_register_instance(:agent,'pinned','verified')"), records)

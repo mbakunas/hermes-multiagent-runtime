@@ -120,7 +120,7 @@ class EffectIntent(IdentityMixin, TimestampMixin, Base):
     )
     attempt_id: Mapped[UUIDValue] = mapped_column(UUID(as_uuid=True))
     action_digest: Mapped[str] = mapped_column(String(64))
-    approval_request_id: Mapped[UUIDValue] = mapped_column(UUID(as_uuid=True))
+    approval_request_id: Mapped[UUIDValue] = mapped_column(UUID(as_uuid=True), unique=True)
     business_idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
     execution_status: Mapped[EffectStatus] = mapped_column(enum_type(EffectStatus), server_default=text("'prepared'"))
     external_reference: Mapped[str | None] = mapped_column(String(2048))

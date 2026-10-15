@@ -67,6 +67,8 @@ def seed_task(connection, *, node=None, create_instance=True):
         INSERT INTO agents(name, role, desired_state, approved_profile_revision)
         VALUES (gen_random_uuid()::text, 'researcher', 'enabled', 'verified') RETURNING id
     """))
+    connection.execute(text("INSERT INTO agent_placements(agent_id,node_id) VALUES (:agent,:node)"),
+                       {"agent": agent, "node": node})
     instance = None
     if create_instance:
         instance = connection.scalar(text("""

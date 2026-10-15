@@ -67,6 +67,8 @@ def test_unique_and_check_constraints_match_revision():
             expected_unique.add(("id", "task_id", "action_digest"))
         if table_name == "agent_placements":
             expected_unique.add(("agent_id", "node_id"))
+        if table_name == "effect_intents":
+            expected_unique.add(("approval_request_id",))
         assert actual_unique == expected_unique
         actual_checks = {str(item.sqltext) for item in table.constraints if isinstance(item, CheckConstraint)}
         expected_checks = {expression for _, expression in revision.CHECKS.get(table_name, ())}
