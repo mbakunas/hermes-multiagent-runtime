@@ -3,6 +3,7 @@ name: PostgreSQL Integrity
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -35,4 +36,13 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install -e '.[test]'
       - name: Run schema, service-login, and concurrency tests
-        run: python -m pytest -q
+        run: python -m pytest -q --randomly-seed=20261015
+      - name: Run order-sensitive tests individually
+        shell: bash
+        run: |
+          for test in \
+            test_archival_is_privileged_audited_and_preserves_unpublished \
+            test_two_publishers_lease_disjoint_batches \
+            test_live_schema_matches_model_keys_and_foreign_keys; do
+            python -m pytest -q "tests/test_service_workflows.py::$test"
+          done
