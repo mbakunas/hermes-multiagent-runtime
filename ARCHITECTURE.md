@@ -380,9 +380,31 @@ The Hermes Constitution requires explicit approval for sensitive actions, includ
 
 `ApprovalRequest` binds an exact action to a task/attempt, policy revision, target resources, artifact/input checksums, effect scope, expiry, and requester. `ApprovalDecision` is an append-only authenticated user approve/reject decision bound to that request revision, with reason, timestamp, and idempotency key.
 
-Request state: `pending -> approved/rejected/expired/cancelled`. An approved request may become `revoked` before its effect begins. Changes to action, destination, artifact content, or policy-sensitive parameters invalidate the old request and require a new revision/request. Approval does not automatically transfer to another task or attempt.
+Request state: pending -> approved/rejected/expired/cancelled.
 
-Task state: `running -> waiting_approval -> ready -> assigned -> running`, or `waiting_approval -> cancelled/failed` after rejection/expiry according to workflow policy. Phase 1 stops execution at a supported safe boundary and does not retain a live process indefinitely. Resumption is a new, explicit attempt that uses a newly bound approval if the attempt/action contract changed.
+An approved request may become revoked before its effect begins.
+
+Changes to action, destination, artifact content, policy-sensitive parameters, or the approved action digest invalidate the old request and require a new revision/request.
+
+Approval is bound to a specific task and approved action digest.
+
+An approval may be consumed by a continuation attempt of the same task when the approved action digest remains unchanged.
+
+Approval never transfers to a different task.
+
+Approvals are single-use. Once an approved action records an effect intent, that approval request is consumed and cannot authorize another effect. Unknown external outcomes require reconciliation rather than approval reuse.
+
+Task state: `running -> waiting_approval -> ready -> assigned -> running`, or `waiting_approval -> cancelled/failed` after rejection/expiry according to workflow policy. Phase 1 stops execution at a supported safe boundary and does not retain a live process indefinitely. Resumption is a new, explicit attempt.
+
+A continuation attempt may reuse the existing approval only when:
+
+- the task identity is unchanged,
+- the approved action digest is unchanged,
+- the approval remains valid and unrevoked,
+- and the approval has not already been consumed.
+
+Any change to the approved action contract requires a new approval
+request and decision.
 
 ### Enforcement And Audit
 
