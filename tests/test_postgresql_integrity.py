@@ -1,6 +1,30 @@
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+
+
+def test_populated_upgrade_preserves_events_and_publication_provenance(disposable_database):
+    with disposable_database.begin() as connection:
+        config = Config(str(Path(__file__).parents[1] / "src/hermes_coordination/storage/migrations/alembic.ini"))
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0001_phase1")
+        connection.exec_driver_sql("""
+            UPDATE outbox_events SET publication_status='published'
+            WHERE id=(SELECT id FROM outbox_events ORDER BY created_at,id LIMIT 1)
+        """)
+        identities = {table: connection.execute(text(f"SELECT id,created_at FROM {table} ORDER BY id")).all()
+                      for table in ("audit_events", "task_events", "outbox_events")}
+        command.upgrade(config, "head")
+        for table, expected in identities.items():
+            assert connection.execute(text(f"SELECT id,created_at FROM {table} ORDER BY id")).all() == expected
+        assert connection.scalar(text("""
+            SELECT count(*) FROM audit_events WHERE action='publication.changed'
+                AND entity_type <> 'outbox_events' AND payload ? 'event_id'
+        """)) == 1
 
 
 @pytest.fixture

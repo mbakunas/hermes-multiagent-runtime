@@ -12,38 +12,48 @@ from sqlalchemy.pool import NullPool
 
 
 @pytest.fixture(scope="session")
-def engine():
+def database_cluster():
     url = environ.get("HERMES_TEST_DATABASE_URL")
     if not url:
         if environ.get("CI"):
             pytest.fail("CI requires HERMES_TEST_DATABASE_URL; integration tests must not be skipped")
         pytest.skip("Set HERMES_TEST_DATABASE_URL to an empty disposable PostgreSQL 17+ database")
-    database = create_engine(url, poolclass=NullPool, hide_parameters=True,
-                             connect_args={"options": "-c timezone=UTC -c lock_timeout=10s -c statement_timeout=30s"})
-    with database.begin() as connection:
+    cluster = create_engine(url, poolclass=NullPool, hide_parameters=True, isolation_level="AUTOCOMMIT")
+    with cluster.connect() as connection:
         if connection.scalar(text("SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")):
             raise RuntimeError("Database integration tests require an empty disposable database")
-        config = Config(str(Path(__file__).parents[1] / "src/hermes_coordination/storage/migrations/alembic.ini"))
-        config.attributes["connection"] = connection
-        command.upgrade(config, "0001_phase1")
-        connection.exec_driver_sql("""
-            UPDATE outbox_events SET publication_status = 'published'
-            WHERE id = (SELECT id FROM outbox_events ORDER BY created_at, id LIMIT 1)
-        """)
-        legacy_events = {table: connection.execute(text(
-            f"SELECT id,created_at FROM {table} ORDER BY id")).all()
-            for table in ("audit_events", "task_events", "outbox_events")}
-        command.upgrade(config, "head")
-        for table, identities in legacy_events.items():
-            assert connection.execute(text(f"SELECT id,created_at FROM {table} ORDER BY id")).all() == identities
-        connection.exec_driver_sql("GRANT hermes_orchestrator TO CURRENT_USER")
+    try:
+        yield cluster
+    finally:
+        cluster.dispose()
+
+
+@pytest.fixture
+def disposable_database(database_cluster):
+    name = f"hermes_test_{uuid4().hex}"
+    with database_cluster.connect() as connection:
+        connection.exec_driver_sql(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)).as_string())
+    database = create_engine(database_cluster.url.set(database=name), poolclass=NullPool, hide_parameters=True,
+                             connect_args={"options": "-c timezone=UTC -c lock_timeout=10s -c statement_timeout=30s"})
     try:
         yield database
     finally:
         database.dispose()
+        with database_cluster.connect() as connection:
+            connection.exec_driver_sql(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)).as_string())
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
+def engine(disposable_database):
+    with disposable_database.begin() as connection:
+        config = Config(str(Path(__file__).parents[1] / "src/hermes_coordination/storage/migrations/alembic.ini"))
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
+        connection.exec_driver_sql("GRANT hermes_orchestrator TO CURRENT_USER")
+    return disposable_database
+
+
+@pytest.fixture
 def services(engine):
     connections = {"actors": {}}
     logins = []

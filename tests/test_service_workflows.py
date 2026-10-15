@@ -97,6 +97,10 @@ def test_real_login_roles_are_distinct_and_unprivileged(services):
 
 
 def test_live_schema_matches_model_keys_and_foreign_keys(engine):
+    with engine.begin() as connection:
+        records = seed_task(connection)
+        event = connection.scalar(text("SELECT id FROM outbox_events WHERE entity_id=:task"), records)
+        connection.execute(text("UPDATE outbox_events SET publication_status='published' WHERE id=:event"), {"event": event})
     with engine.connect() as connection:
         catalog = inspect(connection)
         for name, table in Base.metadata.tables.items():
@@ -301,6 +305,8 @@ def test_archival_is_privileged_audited_and_preserves_unpublished(engine, servic
 
 
 def test_outbox_lease_only_changes_do_not_generate_audits(engine, services):
+    with engine.begin() as connection:
+        seed_task(connection)
     with Session(services["outbox"]) as session:
         repository = OutboxRepository(session)
         leased = repository.lease(limit=1)
@@ -323,7 +329,19 @@ def test_outbox_lease_only_changes_do_not_generate_audits(engine, services):
         session.commit()
 
 
-def test_two_publishers_lease_disjoint_batches(services):
+def test_two_publishers_lease_disjoint_batches(engine, services):
+    with engine.begin() as connection:
+        records = seed_task(connection)
+        tasks = [connection.scalar(text("""
+            INSERT INTO tasks(workflow_id,specification_revision,output_contract)
+            VALUES (:workflow,'publisher-test','{}') RETURNING id
+        """), records) for _ in range(10)]
+        expected = set(connection.scalars(text("SELECT id FROM outbox_events WHERE entity_id=ANY(:tasks)"), {"tasks": tasks}))
+    assert len(expected) == 10
+    with services["outbox"].begin() as connection:
+        connection.execute(text("""
+            UPDATE outbox_events SET retry_at=clock_timestamp()+interval '1 day' WHERE id<>ALL(:events)
+        """), {"events": list(expected)})
     barrier = Barrier(2)
 
     def publish():
@@ -342,6 +360,7 @@ def test_two_publishers_lease_disjoint_batches(services):
         first, second = [future.result(timeout=20) for future in futures]
     assert len(first) == len(second) == 5
     assert first.isdisjoint(second)
+    assert first | second == expected
 
 
 def test_concurrent_double_assignment(engine, services):
