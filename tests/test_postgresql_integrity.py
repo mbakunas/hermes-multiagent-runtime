@@ -70,6 +70,9 @@ def seed_assignment(connection, records, *, attempt_number=1):
 
 
 def assert_rejected(connection, statement, parameters=None, *, sqlstate="P0001"):
+    if statement.lstrip().upper().startswith("TRUNCATE"):
+        connection.exec_driver_sql("SET CONSTRAINTS ALL IMMEDIATE")
+        connection.exec_driver_sql("SET CONSTRAINTS ALL DEFERRED")
     with pytest.raises(DBAPIError) as error:
         with connection.begin_nested():
             connection.execute(text(statement), parameters or {})
@@ -220,7 +223,8 @@ def test_proposals_require_atomic_acceptance_and_freeze_payload(connection):
         VALUES (:agent,:instance,:task,:attempt,'follow_up_research','submitted','{}',repeat('a',64),
             CURRENT_TIMESTAMP + interval '5 minutes',gen_random_uuid()::text) RETURNING id
     """), {**records, "attempt": attempt.id})
-    assert_rejected(connection, "UPDATE work_proposals SET payload_json='{\"changed\":true}' WHERE id=:proposal", {"proposal": proposal})
+    assert_rejected(connection, "UPDATE work_proposals SET payload_json=CAST(:payload AS jsonb) WHERE id=:proposal",
+                    {"proposal": proposal, "payload": '{"changed":true}'})
     assert_rejected(connection, "UPDATE work_proposals SET state='accepted' WHERE id=:proposal", {"proposal": proposal})
     assert_rejected(connection, "INSERT INTO proposal_artifacts(proposal_id,artifact_id) VALUES (:proposal,:artifact)",
                     {**records, "proposal": proposal})
