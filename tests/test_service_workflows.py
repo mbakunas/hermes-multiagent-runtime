@@ -191,6 +191,27 @@ def test_request_decide_continue_record_and_dispatch(services, approved_continua
                                  {**records, "effect": effect})
 
 
+def test_third_attempt_cannot_reuse_consumed_approval(services, approved_continuation):
+    records = approved_continuation.copy()
+    with services["node"].begin() as connection:
+        owned_write(connection, records, "effect_intents", {
+            "approval_request_id": str(records["approval"]), "business_idempotency_key": str(uuid4())})
+        assert connection.scalar(text("""
+            SELECT public.hermes_complete_attempt(:attempt,:token,'failed','retry later','{}',ARRAY[]::uuid[],NULL)
+        """), records)
+    with services["orchestrator"].begin() as connection:
+        connection.execute(text("UPDATE tasks SET state='ready' WHERE id=:task"), records)
+        assignment, attempt = seed_assignment(connection, {**records, "actor": services["actors"]["orchestrator"]}, attempt_number=3)
+        records.update(assignment=assignment, attempt=attempt.id, token=attempt.ownership_token)
+    with services["node"].begin() as connection:
+        claim(connection, records)
+        assert_rejected(connection, """
+            SELECT public.hermes_write_owned_record('effect_intents',:attempt,:token,
+                jsonb_build_object('approval_request_id',CAST(:approval AS text),'business_idempotency_key',gen_random_uuid()::text))
+        """, records, sqlstate="23505")
+        assert connection.scalar(text("SELECT count(*) FROM effect_intents WHERE approval_request_id=:approval"), records) == 1
+
+
 def test_continuation_approval_still_binds_task_and_digest(engine, services, approved_continuation):
     records = approved_continuation
     with services["orchestrator"].begin() as connection:
@@ -272,15 +293,68 @@ def test_placement_administration_is_audited_and_digest_still_checked(engine, se
         assert connection.scalar(text("SELECT public.hermes_register_instance(:agent,'pinned','verified')"), records)
 
 
-def test_archival_is_privileged_audited_and_preserves_unpublished(engine, services):
+def test_revoked_placement_blocks_new_assignments(engine, services):
+    with engine.begin() as connection:
+        records = seed_task(connection, node=services["node_id"])
+    records["actor"] = services["actors"]["orchestrator"]
+    with services["admin"].begin() as connection:
+        connection.execute(text("UPDATE agent_placements SET enabled=false WHERE agent_id=:agent AND node_id=:node"), records)
+    with services["orchestrator"].begin() as connection:
+        assert_rejected(connection, """
+            INSERT INTO assignments(task_id,instance_id,authoritative_assigner,selection_rationale,capability_snapshot)
+            VALUES (:task,:instance,:actor,'revoked placement','[]')
+        """, records)
+    with services["admin"].begin() as connection:
+        connection.execute(text("UPDATE agent_placements SET enabled=true WHERE agent_id=:agent AND node_id=:node"), records)
+    with services["orchestrator"].begin() as connection:
+        assert seed_assignment(connection, records)
+
+
+@pytest.mark.parametrize("service", ["admin", "orchestrator"])
+@pytest.mark.parametrize("field", ["agent_id", "node_id"])
+def test_instance_agent_and_node_are_immutable(engine, services, node_task, service, field):
+    with engine.begin() as connection:
+        other = seed_task(connection, create_instance=False)
+    replacement = other["agent"] if field == "agent_id" else other["node"]
+    with services[service].begin() as connection:
+        assert_rejected(connection, f"UPDATE agent_instances SET {field}=:replacement WHERE id=:instance",
+                        {**node_task, "replacement": replacement})
+        row = connection.execute(text("SELECT agent_id,node_id FROM agent_instances WHERE id=:instance"), node_task).one()
+        assert (row.agent_id, row.node_id) == (node_task["agent"], node_task["node"])
+
+
+def seed_archival_history(engine, *, rows=1):
     with engine.begin() as connection:
         records = seed_task(connection)
-        connection.execute(text("UPDATE tasks SET priority=priority+1 WHERE id=:task"), records)
-        events = connection.execute(text("SELECT id FROM outbox_events WHERE entity_id=:task ORDER BY entity_version"), records).scalars().all()
-    with services["outbox"].begin() as connection:
-        connection.execute(text("UPDATE outbox_events SET publication_status='published' WHERE id=:id"), {"id": events[0]})
-    with engine.connect() as connection:
-        cutoff = connection.scalar(text("SELECT clock_timestamp()"))
+        records["created_at"] = connection.scalar(text("SELECT clock_timestamp()-interval '120 days'"))
+        records["cutoff"] = connection.scalar(text("SELECT clock_timestamp()-interval '100 days'"))
+    with engine.begin() as connection:
+        for table in ("audit_events", "task_events", "outbox_events"):
+            connection.exec_driver_sql(f"ALTER TABLE {table} DISABLE TRIGGER b_guard")
+        connection.execute(text("""
+            INSERT INTO audit_events(entity_type,entity_id,actor,action,payload,correlation_id,created_at)
+            SELECT 'tasks',:task,:actor,'fixture.imported','{}',:task,:created_at FROM generate_series(1,:rows)
+        """), {**records, "rows": rows})
+        connection.execute(text("""
+            INSERT INTO task_events(task_id,actor,action,new_state,reason,correlation_id,created_at)
+            SELECT :task,:actor,'fixture.imported','ready','imported history',:task,:created_at FROM generate_series(1,:rows)
+        """), {**records, "rows": rows})
+        events = connection.execute(text("""
+            INSERT INTO outbox_events(entity_id,entity_type,entity_version,event_type,envelope,topic,publication_status,created_at)
+            SELECT :task,'tasks',1,'fixture.imported','{}','test/history',
+                CASE WHEN sequence <= :rows THEN 'published' ELSE 'pending' END::public."OutboxPublicationStatus",:created_at
+            FROM generate_series(1,:rows+1) AS sequence RETURNING id,publication_status
+        """), {**records, "rows": rows}).all()
+        connection.exec_driver_sql("SET CONSTRAINTS ALL IMMEDIATE")
+        for table in ("audit_events", "task_events", "outbox_events"):
+            connection.exec_driver_sql(f"ALTER TABLE {table} ENABLE TRIGGER b_guard")
+    return records, [row.id for row in events if row.publication_status == "published"], next(
+        row.id for row in events if row.publication_status == "pending")
+
+
+def test_archival_is_privileged_audited_and_preserves_unpublished(engine, services):
+    records, published, pending = seed_archival_history(engine)
+    cutoff = records["cutoff"]
     with services["node"].begin() as connection:
         assert_rejected(connection, "SELECT public.hermes_archive_events(:cutoff,'retention')", {"cutoff": cutoff}, sqlstate="42501")
     with services["admin"].begin() as connection:
@@ -292,19 +366,86 @@ def test_archival_is_privileged_audited_and_preserves_unpublished(engine, servic
             probe = connection.scalar(text("SELECT public.hermes_archive_events(:cutoff,'rollback probe')"), {"cutoff": cutoff})
             assert probe["outbox_events"] >= 1
             savepoint.rollback()
-        assert connection.scalar(text("SELECT EXISTS(SELECT 1 FROM outbox_events WHERE id=:id)"), {"id": events[0]})
+        assert connection.scalar(text("SELECT EXISTS(SELECT 1 FROM outbox_events WHERE id=:id)"), {"id": published[0]})
         assert connection.scalar(text("SELECT count(*) FROM audit_events WHERE payload->>'reason'='rollback probe'")) == 0
         deleted = connection.scalar(text("SELECT public.hermes_archive_events(:cutoff,'validated export retained elsewhere')"), {"cutoff": cutoff})
         assert deleted["outbox_events"] >= 1
         assert deleted["audit_events"] >= 1
         assert deleted["task_events"] >= 1
-        assert not connection.scalar(text("SELECT EXISTS(SELECT 1 FROM outbox_events WHERE id=:id)"), {"id": events[0]})
-        assert connection.scalar(text("SELECT publication_status FROM outbox_events WHERE id=:id"), {"id": events[1]}) == "pending"
+        assert not connection.scalar(text("SELECT EXISTS(SELECT 1 FROM outbox_events WHERE id=:id)"), {"id": published[0]})
+        assert connection.scalar(text("SELECT publication_status FROM outbox_events WHERE id=:id"), {"id": pending}) == "pending"
         audit = connection.execute(text("SELECT actor,payload FROM audit_events WHERE action='events.archived' ORDER BY created_at DESC LIMIT 1")).one()
         assert audit.actor == services["actors"]["admin"]
         assert audit.payload["deleted"] == deleted
         assert audit.payload["reason"] == "validated export retained elsewhere"
         assert_rejected(connection, "UPDATE audit_events SET action='rewritten'", sqlstate="42501")
+
+
+def test_archival_floor_is_positive_and_configurable(engine, services):
+    records, _, _ = seed_archival_history(engine)
+    with services["admin"].begin() as connection:
+        for days in (0, 30):
+            assert_rejected(connection, """
+                SELECT public.hermes_archive_events(CURRENT_TIMESTAMP-make_interval(days=>:days),'too recent')
+            """, {"days": days}, sqlstate="22023")
+        for setting in ("0", "-1", "180"):
+            connection.execute(text("SELECT set_config('hermes.event_retention_days',:days,true)"), {"days": setting})
+            assert_rejected(connection, "SELECT public.hermes_archive_events(:cutoff,'invalid floor or cutoff')", records, sqlstate="22023")
+        connection.exec_driver_sql("SET LOCAL hermes.event_retention_days='30'")
+        before = connection.scalar(text("SHOW statement_timeout"))
+        assert connection.scalar(text("SELECT public.hermes_archive_events(:cutoff,'configured retention')"), records)["outbox_events"] == 1
+        assert connection.scalar(text("SHOW statement_timeout")) == before
+        config = connection.scalar(text("""
+            SELECT proconfig FROM pg_proc WHERE oid='public.hermes_archive_events(timestamptz,text)'::regprocedure
+        """))
+        assert {item.split("=",1)[0] for item in config} >= {"statement_timeout", "transaction_timeout"}
+
+
+def test_archival_deletes_in_bounded_batches(engine, services):
+    records, _, pending = seed_archival_history(engine, rows=5001)
+    with services["admin"].begin() as connection:
+        first = connection.scalar(text("SELECT public.hermes_archive_events(:cutoff,'first batch')"), records)
+        assert first == {"outbox_events": 5000, "audit_events": 5000, "task_events": 5000}
+    with services["admin"].begin() as connection:
+        second = connection.scalar(text("SELECT public.hermes_archive_events(:cutoff,'last batch')"), records)
+        assert second == {"outbox_events": 1, "audit_events": 1, "task_events": 1}
+        assert connection.scalar(text("SELECT publication_status FROM outbox_events WHERE id=:id"), {"id": pending}) == "pending"
+
+
+def test_partition_maintenance_creates_and_routes_future_months(engine, services):
+    with engine.begin() as connection:
+        records = seed_task(connection)
+        records["future"] = connection.scalar(text("SELECT date_trunc('month',CURRENT_TIMESTAMP)+interval '15 months 5 days'"))
+    with engine.begin() as connection:
+        connection.exec_driver_sql("ALTER TABLE outbox_events DISABLE TRIGGER b_guard")
+        records["event"] = connection.scalar(text("""
+            INSERT INTO outbox_events(entity_id,entity_type,entity_version,event_type,envelope,topic,created_at)
+            VALUES (:task,'tasks',1,'future-test','{}','test/future',:future) RETURNING id
+        """), records)
+        connection.exec_driver_sql("SET CONSTRAINTS ALL IMMEDIATE")
+        connection.exec_driver_sql("ALTER TABLE outbox_events ENABLE TRIGGER b_guard")
+        assert connection.scalar(text("SELECT tableoid::regclass::text FROM outbox_events WHERE id=:event"), records) == "outbox_events_default"
+    with services["node"].begin() as connection:
+        assert_rejected(connection, "SELECT public.hermes_ensure_event_partitions(15)", sqlstate="42501")
+    with services["admin"].begin() as connection:
+        assert_rejected(connection, "SELECT public.hermes_ensure_event_partitions(0)", sqlstate="22023")
+        assert connection.scalar(text("SELECT public.hermes_ensure_event_partitions(15)")) == 9
+        assert connection.scalar(text("SELECT public.hermes_ensure_event_partitions(15)")) == 0
+        assert connection.scalar(text("SELECT tableoid::regclass::text <> 'outbox_events_default' FROM outbox_events WHERE id=:event"), records)
+        for table in ("audit_events", "task_events", "outbox_events"):
+            expected = connection.scalar(text("SELECT :table || '_' || to_char(CAST(:future AS timestamptz),'YYYYMM')"),
+                                         {"table": table, "future": records["future"]})
+            assert connection.scalar(text("SELECT to_regclass(:partition) IS NOT NULL"), {"partition": expected})
+    with engine.begin() as connection:
+        connection.exec_driver_sql("ALTER TABLE outbox_events DISABLE TRIGGER b_guard")
+        newer = connection.scalar(text("""
+            INSERT INTO outbox_events(entity_id,entity_type,entity_version,event_type,envelope,topic,created_at)
+            VALUES (:task,'tasks',1,'future-test','{}','test/future',:future) RETURNING id
+        """), records)
+        connection.exec_driver_sql("SET CONSTRAINTS ALL IMMEDIATE")
+        connection.exec_driver_sql("ALTER TABLE outbox_events ENABLE TRIGGER b_guard")
+        assert connection.scalar(text("SELECT tableoid::regclass::text <> 'outbox_events_default' FROM outbox_events WHERE id=:event"),
+                                 {"event": newer})
 
 
 def test_outbox_lease_only_changes_do_not_generate_audits(engine, services):

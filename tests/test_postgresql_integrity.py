@@ -67,10 +67,10 @@ def seed_task(connection, *, node=None, create_instance=True):
         INSERT INTO agents(name, role, desired_state, approved_profile_revision)
         VALUES (gen_random_uuid()::text, 'researcher', 'enabled', 'verified') RETURNING id
     """))
-    connection.execute(text("INSERT INTO agent_placements(agent_id,node_id) VALUES (:agent,:node)"),
-                       {"agent": agent, "node": node})
     instance = None
     if create_instance:
+        connection.execute(text("INSERT INTO agent_placements(agent_id,node_id) VALUES (:agent,:node)"),
+                           {"agent": agent, "node": node})
         instance = connection.scalar(text("""
             INSERT INTO agent_instances(agent_id, node_id, hermes_version, verified_profile_digest, state, readiness)
             VALUES (:agent, :node, 'pinned', 'verified', 'ready', 'ready') RETURNING id

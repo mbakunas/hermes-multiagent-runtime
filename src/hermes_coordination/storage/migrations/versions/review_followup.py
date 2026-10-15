@@ -75,9 +75,10 @@ BEGIN
                 RAISE EXCEPTION 'Node cannot schedule work';
             END IF;
         END IF;
-        IF record_table = 'agent_instances' AND
-           (NEW.agent_id IS DISTINCT FROM OLD.agent_id OR NEW.node_id IS DISTINCT FROM OLD.node_id) THEN
-            RAISE EXCEPTION 'Instance agent/node identity is immutable';
+        IF record_table = 'agent_instances' THEN
+            IF NEW.agent_id IS DISTINCT FROM OLD.agent_id OR NEW.node_id IS DISTINCT FROM OLD.node_id THEN
+                RAISE EXCEPTION 'Instance agent/node identity is immutable';
+            END IF;
         END IF;
         IF record_table = 'agent_placements' AND
            (proposed - ARRAY['enabled','updated_at']) IS DISTINCT FROM (previous - ARRAY['enabled','updated_at']) THEN
