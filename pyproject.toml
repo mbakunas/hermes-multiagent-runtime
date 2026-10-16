@@ -20,7 +20,7 @@ test = ["pytest>=8.3,<10", "pytest-randomly>=3.16,<5"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-"hermes_coordination.storage" = ["migrations/alembic.ini"]
+"hermes_coordination.storage" = ["migrations/alembic.ini", "migrations/script.py.mako"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
