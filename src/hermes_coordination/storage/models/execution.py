@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint, text
@@ -8,6 +8,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, IdentityMixin, bounded_json, enum_type
 from .enums import AcceptedOutcome, ExecutionStatus
+
+if TYPE_CHECKING:
+    from .agents import Agent
+    from .artifacts import ArtifactMetadata
+    from .attempts import TaskAttempt
 
 
 class ExecutionRun(IdentityMixin, Base):
@@ -28,6 +33,9 @@ class ExecutionRun(IdentityMixin, Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    attempt: Mapped["TaskAttempt"] = relationship(viewonly=True, lazy="raise")
+    profile: Mapped["Agent"] = relationship(viewonly=True, lazy="raise")
+
 
 class TaskResult(IdentityMixin, Base):
     __tablename__ = "task_results"
@@ -44,6 +52,8 @@ class TaskResult(IdentityMixin, Base):
     )
     accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"))
 
+    attempt: Mapped["TaskAttempt"] = relationship(viewonly=True, lazy="raise")
+
 
 class TaskResultArtifact(IdentityMixin, Base):
     __tablename__ = "task_result_artifacts"
@@ -56,3 +66,4 @@ class TaskResultArtifact(IdentityMixin, Base):
         UUID(as_uuid=True), ForeignKey("artifact_metadata.id", ondelete="RESTRICT"), index=True
     )
     result: Mapped[TaskResult] = relationship(back_populates="artifact_references")
+    artifact: Mapped["ArtifactMetadata"] = relationship(viewonly=True, lazy="raise")

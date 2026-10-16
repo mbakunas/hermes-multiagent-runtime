@@ -1,12 +1,17 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, IdentityMixin, TimestampMixin, enum_type
 from .enums import AgentRole, AgentState, InstanceState, ReadinessState
+
+if TYPE_CHECKING:
+    from .capabilities import InstanceCapability
+    from .nodes import Node
 
 
 class Agent(IdentityMixin, TimestampMixin, Base):
@@ -18,6 +23,11 @@ class Agent(IdentityMixin, TimestampMixin, Base):
         enum_type(AgentState), server_default=text("'provisioned'")
     )
     approved_profile_revision: Mapped[str] = mapped_column(String(128))
+
+    instances: Mapped[list["AgentInstance"]] = relationship(
+        back_populates="agent", viewonly=True, lazy="raise"
+    )
+    placements: Mapped[list["AgentPlacement"]] = relationship(viewonly=True, lazy="raise")
 
 
 class AgentPlacement(IdentityMixin, TimestampMixin, Base):
@@ -31,6 +41,9 @@ class AgentPlacement(IdentityMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("nodes.id", ondelete="RESTRICT"), index=True
     )
     enabled: Mapped[bool] = mapped_column(server_default=text("true"))
+
+    agent: Mapped["Agent"] = relationship(viewonly=True, lazy="raise")
+    node: Mapped["Node"] = relationship(viewonly=True, lazy="raise")
 
 
 class AgentInstance(IdentityMixin, TimestampMixin, Base):
@@ -61,3 +74,7 @@ class AgentInstance(IdentityMixin, TimestampMixin, Base):
     )
     capacity: Mapped[int] = mapped_column(server_default=text("1"))
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    agent: Mapped["Agent"] = relationship(back_populates="instances", viewonly=True, lazy="raise")
+    node: Mapped["Node"] = relationship(viewonly=True, lazy="raise")
+    capabilities: Mapped[list["InstanceCapability"]] = relationship(viewonly=True, lazy="raise")

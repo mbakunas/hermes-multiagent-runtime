@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Index, String, UniqueConstraint, text
@@ -8,6 +8,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, CreatedMixin, IdentityMixin, TimestampMixin, bounded_json, enum_type
 from .enums import ApprovalDecision, ApprovalState, EffectStatus, PolicyActivationState
+
+if TYPE_CHECKING:
+    from .artifacts import ArtifactMetadata
+    from .attempts import TaskAttempt
+    from .identities import Principal
+    from .tasks import Task
 
 
 class ApprovalPolicy(IdentityMixin, CreatedMixin, Base):
@@ -27,6 +33,8 @@ class ApprovalPolicy(IdentityMixin, CreatedMixin, Base):
     expiry_rules: Mapped[dict[str, Any]] = mapped_column(JSONB)
     policy_digest: Mapped[str] = mapped_column(String(64))
     activation_state: Mapped[PolicyActivationState] = mapped_column(enum_type(PolicyActivationState))
+
+    requests: Mapped[list["ApprovalRequest"]] = relationship(viewonly=True, lazy="raise")
 
 
 class ApprovalRequest(IdentityMixin, TimestampMixin, Base):
@@ -66,6 +74,13 @@ class ApprovalRequest(IdentityMixin, TimestampMixin, Base):
     state: Mapped[ApprovalState] = mapped_column(enum_type(ApprovalState), server_default=text("'pending'"))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
+    task: Mapped["Task"] = relationship(viewonly=True, lazy="raise")
+    attempt: Mapped["TaskAttempt"] = relationship(viewonly=True, lazy="raise")
+    policy: Mapped["ApprovalPolicy"] = relationship(viewonly=True, lazy="raise")
+    requester: Mapped["Principal"] = relationship(viewonly=True, lazy="raise")
+    decisions: Mapped[list["ApprovalDecisionRecord"]] = relationship(viewonly=True, lazy="raise")
+    effect: Mapped["EffectIntent | None"] = relationship(viewonly=True, lazy="raise")
+
 
 class ApprovalRequestArtifact(IdentityMixin, Base):
     __tablename__ = "approval_request_artifacts"
@@ -81,6 +96,7 @@ class ApprovalRequestArtifact(IdentityMixin, Base):
     artifact_id: Mapped[UUIDValue] = mapped_column(UUID(as_uuid=True), index=True)
     checksum_digest: Mapped[str] = mapped_column(String(64))
     request: Mapped[ApprovalRequest] = relationship(back_populates="artifact_digests")
+    artifact: Mapped["ArtifactMetadata"] = relationship(viewonly=True, lazy="raise")
 
 
 class ApprovalDecisionRecord(IdentityMixin, CreatedMixin, Base):
@@ -100,6 +116,9 @@ class ApprovalDecisionRecord(IdentityMixin, CreatedMixin, Base):
     decision: Mapped[ApprovalDecision] = mapped_column(enum_type(ApprovalDecision))
     reason: Mapped[str] = mapped_column(String(4096))
     idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
+
+    request: Mapped["ApprovalRequest"] = relationship(viewonly=True, lazy="raise")
+    user: Mapped["Principal"] = relationship(viewonly=True, lazy="raise")
 
 
 class EffectIntent(IdentityMixin, TimestampMixin, Base):
@@ -124,3 +143,7 @@ class EffectIntent(IdentityMixin, TimestampMixin, Base):
     business_idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
     execution_status: Mapped[EffectStatus] = mapped_column(enum_type(EffectStatus), server_default=text("'prepared'"))
     external_reference: Mapped[str | None] = mapped_column(String(2048))
+
+    task: Mapped["Task"] = relationship(viewonly=True, lazy="raise")
+    attempt: Mapped["TaskAttempt"] = relationship(viewonly=True, lazy="raise")
+    approval: Mapped["ApprovalRequest"] = relationship(viewonly=True, lazy="raise")

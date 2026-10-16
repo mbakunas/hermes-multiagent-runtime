@@ -1,0 +1,1 @@
+"""Node-side ownership, process supervision, and result collection."""

@@ -1,10 +1,26 @@
 from pathlib import Path
+import ast
+from shutil import copytree
 
 from alembic import command
 from alembic.config import Config
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+
+
+def test_alembic_autogeneration_matches_migrated_schema(engine, tmp_path):
+    scripts = tmp_path / "migrations"
+    copytree(Path(__file__).parents[1] / "src/hermes_coordination/storage/migrations", scripts)
+    config = Config(str(scripts / "alembic.ini"))
+    config.set_main_option("script_location", str(scripts))
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        generated = command.revision(config, message="Verify Phase 1 schema", autogenerate=True)
+        assert generated is not None
+        module = ast.parse(Path(generated.path).read_text())
+        upgrade = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "upgrade")
+        assert len(upgrade.body) == 1 and isinstance(upgrade.body[0], ast.Pass)
 
 
 def test_populated_upgrade_preserves_events_and_publication_provenance(disposable_database):

@@ -15,6 +15,44 @@ Target: Python 3.13, PostgreSQL 17+, SQLAlchemy 2.0 typed ORM, Alembic, and psyc
 - [Repositories](../src/hermes_coordination/storage/repositories/__init__.py): SQLAlchemy 2 persistence queries and guarded database calls; no implicit commits, task selection policy, retry scheduling, or destructive delete API.
 - [Contract tests](../tests/test_schema_contracts.py), [database tests](../tests/test_postgresql_integrity.py), and [service workflows](../tests/test_service_workflows.py): validation-host tests, also configured in [PostgreSQL 17 CI](../.github/workflows/postgresql.yml). No local workstation environment is required.
 
+## Package And Model Scaffolding
+
+All namespaces from architecture section 3 are importable, including `intake` and
+`adapters.hermes_agent`. The non-storage packages currently contain docstrings only;
+no services, commands, agent execution, or business logic are implemented there.
+The existing database connection configuration remains in `storage.db`; `config`
+is a namespace reserved for future deployment settings, not an invented configuration contract.
+
+Models expose typed ORM navigation over existing foreign keys. New relationships
+are read-only (`viewonly=True`) and require explicit loading (`lazy="raise"`), so
+navigation cannot silently rewrite historical bindings or bypass restricted writes.
+Use eager loading such as `selectinload` for queries that need related records.
+Existing writable association relationships retain their original behavior.
+
+The schema and its initial revision already existed before this scaffolding work.
+The frozen `0001_phase1` revision and follow-up revisions are preserved, not replaced
+by a second initial migration. Additional support tables and the event-table
+`(id, created_at)` keys are existing implementation choices documented below;
+this work does not change the schema or introduce another interpretation of them.
+
+Alembic includes a packaged revision template. Generate future migrations against
+a disposable PostgreSQL 17+ database upgraded to the existing head:
+
+```sh
+alembic -c src/hermes_coordination/storage/migrations/alembic.ini upgrade head
+alembic -c src/hermes_coordination/storage/migrations/alembic.ini check
+alembic -c src/hermes_coordination/storage/migrations/alembic.ini revision --autogenerate -m "Describe schema change"
+```
+
+`HERMES_DATABASE_URL` must identify the chosen migration database. Physical event
+partitions are excluded from autogeneration using PostgreSQL's partition catalog;
+parent tables and unrelated tables remain visible to schema comparison. Generated
+migrations require review: Alembic does not infer PostgreSQL role grants, trigger
+functions, enum lifecycle changes, or the full partition-maintenance policy.
+The generated downgrade refuses destructive rollback, matching existing revisions.
+Tests render a revision in a temporary directory and, when PostgreSQL is configured,
+assert that autogeneration against the migrated schema produces no table changes.
+
 ## Deployment And Validation
 
 Run these commands on the deployment/validation host, from the repository root, in an existing or deliberately provisioned Python 3.13 environment. No local workstation environment is required.
@@ -65,6 +103,8 @@ Provision a distinct ordinary LOGIN for each service/node, grant only its group 
 Trusted infrastructure logins can read coordination metadata; end-user and worker data scopes must still be enforced by their service/bridge. Workers never receive these credentials. The approval API must authenticate the human and verify `required_approver_role`; the database verifies the registered human FK, revision uniqueness, and durable state/action binding. A browser message or MQTT event is not a decision.
 
 Registration and every new assignment require an enabled `agent_placements(agent_id, node_id)` record provisioned by an admin. Both checks lock the placement against concurrent revocation. Placement identity is immutable; update `enabled` to revoke or restore it. Instance `agent_id` and `node_id` are also immutable, including for Orchestrator/admin writes; moving an instance requires a new registered incarnation. No placement is automatically authorized during upgrade. Existing instances and in-flight assignments are preserved; revocation prevents subsequent registrations and assignments but does not terminate a running process. The profile digest is an integrity check, never a credential or placement authorization.
+
+Logical agent desired state follows `provisioned -> enabled -> disabled -> retired`. PostgreSQL rejects skipped or reversed transitions; repeated writes of the current state are idempotent. Agent identities cannot be deleted, preserving their name, role, and approved profile revision as historical records. Only `hermes_admin` may change agent desired state or provision identities.
 
 Assignments require a ready task, enabled node/agent, ready instance, approved profile digest, and registered required capability IDs. In Phase 1, `approved_profile_revision` stores the approved profile digest used for exact registration/assignment verification; a friendly release label is not substituted for that digest. Complete version-constraint compatibility, heartbeat freshness, optional/preferred scoring, dependencies, quotas, and policy remain Orchestrator responsibilities. The repository `ready()` query is only a persistence candidate query, not a scheduler.
 

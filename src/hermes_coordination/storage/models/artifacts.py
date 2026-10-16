@@ -1,13 +1,18 @@
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Index, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, IdentityMixin, TimestampMixin, bounded_json, enum_type
 from .enums import ArtifactState
+
+if TYPE_CHECKING:
+    from .attempts import TaskAttempt
+    from .identities import Principal
+    from .tasks import Task
 
 
 class ArtifactMetadata(IdentityMixin, TimestampMixin, Base):
@@ -61,6 +66,16 @@ class ArtifactMetadata(IdentityMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("artifact_metadata.id", ondelete="RESTRICT"), index=True
     )
 
+    producing_task: Mapped["Task | None"] = relationship(viewonly=True, lazy="raise")
+    producing_attempt: Mapped["TaskAttempt | None"] = relationship(viewonly=True, lazy="raise")
+    uploader: Mapped["Principal"] = relationship(viewonly=True, lazy="raise")
+    supersedes: Mapped["ArtifactMetadata | None"] = relationship(
+        remote_side="ArtifactMetadata.id", viewonly=True, lazy="raise"
+    )
+    lineage: Mapped[list["ArtifactLineage"]] = relationship(
+        foreign_keys="ArtifactLineage.artifact_id", viewonly=True, lazy="raise"
+    )
+
 
 class ArtifactLineage(IdentityMixin, Base):
     __tablename__ = "artifact_lineage"
@@ -74,4 +89,11 @@ class ArtifactLineage(IdentityMixin, Base):
     )
     source_artifact_id: Mapped[UUIDValue] = mapped_column(
         UUID(as_uuid=True), ForeignKey("artifact_metadata.id", ondelete="RESTRICT"), index=True
+    )
+
+    artifact: Mapped["ArtifactMetadata"] = relationship(
+        foreign_keys=[artifact_id], viewonly=True, lazy="raise"
+    )
+    source: Mapped["ArtifactMetadata"] = relationship(
+        foreign_keys=[source_artifact_id], viewonly=True, lazy="raise"
     )

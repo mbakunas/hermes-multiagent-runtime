@@ -1,12 +1,18 @@
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import ForeignKey, Index, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, IdentityMixin, TimestampMixin, bounded_json, enum_type
 from .enums import AssignmentState
+
+if TYPE_CHECKING:
+    from .agents import AgentInstance
+    from .attempts import TaskAttempt
+    from .identities import Principal
+    from .tasks import Task
 
 
 class Assignment(IdentityMixin, TimestampMixin, Base):
@@ -34,3 +40,8 @@ class Assignment(IdentityMixin, TimestampMixin, Base):
     state: Mapped[AssignmentState] = mapped_column(
         enum_type(AssignmentState), server_default=text("'active'")
     )
+
+    task: Mapped["Task"] = relationship(viewonly=True, lazy="raise")
+    instance: Mapped["AgentInstance"] = relationship(viewonly=True, lazy="raise")
+    assigner: Mapped["Principal"] = relationship(viewonly=True, lazy="raise")
+    attempt: Mapped["TaskAttempt | None"] = relationship(viewonly=True, lazy="raise")

@@ -1,0 +1,1 @@
+"""Versioned coordination records and validation schemas."""

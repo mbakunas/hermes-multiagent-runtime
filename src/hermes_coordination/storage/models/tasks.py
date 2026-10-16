@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import (
@@ -11,6 +11,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, IdentityMixin, TimestampMixin, VersionMixin, bounded_json, enum_type
 from .enums import DependencyCondition, RequirementKind, TaskState
+
+if TYPE_CHECKING:
+    from .assignments import Assignment
+    from .attempts import TaskAttempt
+    from .capabilities import CapabilityDefinition
+    from .workflows import Workflow
 
 
 class Task(IdentityMixin, TimestampMixin, VersionMixin, Base):
@@ -46,6 +52,23 @@ class Task(IdentityMixin, TimestampMixin, VersionMixin, Base):
     state: Mapped[TaskState] = mapped_column(enum_type(TaskState), server_default=text("'pending'"))
     cancellation_intent: Mapped[bool] = mapped_column(server_default=text("false"))
     current_attempt_id: Mapped[UUIDValue | None] = mapped_column(UUID(as_uuid=True))
+
+    workflow: Mapped["Workflow"] = relationship(viewonly=True, lazy="raise")
+    capabilities: Mapped[list["TaskCapability"]] = relationship(viewonly=True, lazy="raise")
+    assignments: Mapped[list["Assignment"]] = relationship(viewonly=True, lazy="raise")
+    attempts: Mapped[list["TaskAttempt"]] = relationship(
+        foreign_keys="TaskAttempt.task_id", viewonly=True, lazy="raise"
+    )
+    current_attempt: Mapped["TaskAttempt | None"] = relationship(
+        primaryjoin="and_(Task.current_attempt_id == TaskAttempt.id, Task.id == TaskAttempt.task_id)",
+        foreign_keys=[current_attempt_id], viewonly=True, lazy="raise",
+    )
+    prerequisites: Mapped[list["TaskDependency"]] = relationship(
+        foreign_keys="TaskDependency.dependent_task_id", viewonly=True, lazy="raise"
+    )
+    dependents: Mapped[list["TaskDependency"]] = relationship(
+        foreign_keys="TaskDependency.prerequisite_task_id", viewonly=True, lazy="raise"
+    )
 
 
 class TaskInputReference(IdentityMixin, Base):
@@ -88,6 +111,9 @@ class TaskCapability(IdentityMixin, Base):
     version_constraint: Mapped[str] = mapped_column(String(128))
     requirement_kind: Mapped[RequirementKind] = mapped_column(enum_type(RequirementKind))
 
+    task: Mapped["Task"] = relationship(viewonly=True, lazy="raise")
+    capability: Mapped["CapabilityDefinition"] = relationship(viewonly=True, lazy="raise")
+
 
 class TaskDependency(IdentityMixin, Base):
     __tablename__ = "task_dependencies"
@@ -104,4 +130,11 @@ class TaskDependency(IdentityMixin, Base):
     )
     condition: Mapped[DependencyCondition] = mapped_column(
         enum_type(DependencyCondition), server_default=text("'success'")
+    )
+
+    prerequisite: Mapped["Task"] = relationship(
+        foreign_keys=[prerequisite_task_id], viewonly=True, lazy="raise"
+    )
+    dependent: Mapped["Task"] = relationship(
+        foreign_keys=[dependent_task_id], viewonly=True, lazy="raise"
     )

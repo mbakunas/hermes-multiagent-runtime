@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Index, String, UniqueConstraint, text
@@ -8,6 +8,13 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, CreatedMixin, IdentityMixin, TimestampMixin, bounded_json, enum_type
 from .enums import ProposalDecision, ProposalState
+
+if TYPE_CHECKING:
+    from .agents import Agent, AgentInstance
+    from .artifacts import ArtifactMetadata
+    from .attempts import TaskAttempt
+    from .identities import Principal
+    from .tasks import Task
 
 
 class WorkProposal(IdentityMixin, TimestampMixin, Base):
@@ -50,6 +57,16 @@ class WorkProposal(IdentityMixin, TimestampMixin, Base):
         back_populates="proposal", lazy="raise", cascade="save-update, merge"
     )
 
+    proposing_agent: Mapped["Agent"] = relationship(viewonly=True, lazy="raise")
+    proposing_instance: Mapped["AgentInstance"] = relationship(viewonly=True, lazy="raise")
+    originating_task: Mapped["Task"] = relationship(viewonly=True, lazy="raise")
+    originating_attempt: Mapped["TaskAttempt"] = relationship(viewonly=True, lazy="raise")
+    predecessor: Mapped["WorkProposal | None"] = relationship(
+        remote_side="WorkProposal.id", viewonly=True, lazy="raise"
+    )
+    generated_tasks: Mapped[list["ProposalTask"]] = relationship(viewonly=True, lazy="raise")
+    decisions: Mapped[list["ProposalDecisionRecord"]] = relationship(viewonly=True, lazy="raise")
+
 
 class ProposalArtifact(IdentityMixin, Base):
     __tablename__ = "proposal_artifacts"
@@ -62,6 +79,7 @@ class ProposalArtifact(IdentityMixin, Base):
         UUID(as_uuid=True), ForeignKey("artifact_metadata.id", ondelete="RESTRICT"), index=True
     )
     proposal: Mapped[WorkProposal] = relationship(back_populates="artifact_references")
+    artifact: Mapped["ArtifactMetadata"] = relationship(viewonly=True, lazy="raise")
 
 
 class ProposalTask(IdentityMixin, Base):
@@ -74,6 +92,9 @@ class ProposalTask(IdentityMixin, Base):
     task_id: Mapped[UUIDValue] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="RESTRICT"), index=True
     )
+
+    proposal: Mapped["WorkProposal"] = relationship(viewonly=True, lazy="raise")
+    task: Mapped["Task"] = relationship(viewonly=True, lazy="raise")
 
 
 class ProposalDecisionRecord(IdentityMixin, CreatedMixin, Base):
@@ -93,3 +114,6 @@ class ProposalDecisionRecord(IdentityMixin, CreatedMixin, Base):
     decision: Mapped[ProposalDecision] = mapped_column(enum_type(ProposalDecision))
     reason: Mapped[str] = mapped_column(String(4096))
     policy_revision: Mapped[str] = mapped_column(String(128))
+
+    proposal: Mapped["WorkProposal"] = relationship(viewonly=True, lazy="raise")
+    orchestrator: Mapped["Principal"] = relationship(viewonly=True, lazy="raise")

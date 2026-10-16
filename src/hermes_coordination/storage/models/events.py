@@ -1,12 +1,16 @@
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import ForeignKey, ForeignKeyConstraint, Index, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, EventIdentityMixin, bounded_json, enum_type
 from .enums import TaskState
+
+if TYPE_CHECKING:
+    from .identities import CoordinationEntity, Principal
+    from .tasks import Task
 
 
 class AuditEvent(EventIdentityMixin, Base):
@@ -34,6 +38,17 @@ class AuditEvent(EventIdentityMixin, Base):
         UUID(as_uuid=True), ForeignKey("coordination_entities.id", ondelete="RESTRICT"), index=True
     )
 
+    entity: Mapped["CoordinationEntity"] = relationship(
+        foreign_keys=[entity_id, entity_type], viewonly=True, lazy="raise"
+    )
+    actor_principal: Mapped["Principal"] = relationship(viewonly=True, lazy="raise")
+    correlation: Mapped["CoordinationEntity"] = relationship(
+        foreign_keys=[correlation_id], viewonly=True, lazy="raise"
+    )
+    causation: Mapped["CoordinationEntity | None"] = relationship(
+        foreign_keys=[causation_id], viewonly=True, lazy="raise"
+    )
+
 
 class TaskEvent(EventIdentityMixin, Base):
     __tablename__ = "task_events"
@@ -54,4 +69,13 @@ class TaskEvent(EventIdentityMixin, Base):
     )
     causation_id: Mapped[UUIDValue | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("coordination_entities.id", ondelete="RESTRICT"), index=True
+    )
+
+    task: Mapped["Task"] = relationship(viewonly=True, lazy="raise")
+    actor_principal: Mapped["Principal"] = relationship(viewonly=True, lazy="raise")
+    correlation: Mapped["CoordinationEntity"] = relationship(
+        foreign_keys=[correlation_id], viewonly=True, lazy="raise"
+    )
+    causation: Mapped["CoordinationEntity | None"] = relationship(
+        foreign_keys=[causation_id], viewonly=True, lazy="raise"
     )
