@@ -113,6 +113,8 @@ def test_all_tables_enums_and_capabilities_created(connection):
             AND relkind IN ('r','p') AND NOT relispartition
     """)) == 34
     assert connection.scalar(text("SELECT count(*) FROM pg_type WHERE typname = 'TaskState'")) == 1
+    assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0003_review_followup", \
+        "Fresh database migration did not reach the Alembic head"
 
 
 def test_authority_privileges(connection):

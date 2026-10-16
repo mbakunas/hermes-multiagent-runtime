@@ -2,6 +2,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import CheckConstraint, DateTime, ForeignKeyConstraint, UniqueConstraint
@@ -14,6 +15,8 @@ from hermes_coordination.storage.models.enums import ENUM_TYPES
 
 
 REVISION_PATH = Path(__file__).parents[1] / "src/hermes_coordination/storage/migrations/versions/initial_schema.py"
+MIGRATION_PATHS = tuple(path for path in sorted(REVISION_PATH.parent.glob("*.py"))
+                        if path.name != "__init__.py")
 spec = spec_from_file_location("phase_one_revision", REVISION_PATH)
 revision = module_from_spec(spec)
 spec.loader.exec_module(revision)
@@ -134,6 +137,16 @@ def test_offline_upgrade_still_emits_complete_sql(monkeypatch):
     assert "hermes_archive_events" in generated
     assert "PARTITION BY RANGE (created_at)" in generated
     assert "agent_placements" in generated
+
+
+@pytest.mark.parametrize("migration_path", MIGRATION_PATHS, ids=lambda path: path.stem)
+def test_migrations_refuse_destructive_downgrade(migration_path):
+    spec = spec_from_file_location(f"migration_{migration_path.stem}", migration_path)
+    migration = module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    with pytest.raises(RuntimeError, match="verified backup"):
+        migration.downgrade()
 
 
 def test_tables_compile_for_postgresql_and_no_blob_columns():
