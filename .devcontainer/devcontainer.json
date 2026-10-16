@@ -12,5 +12,6 @@
                 "ms-python.python"
             ]
         }
-    }
+    },
+    "postCreateCommand": "python -m pip install -e '.[test]'"
 }
