@@ -1,12 +1,15 @@
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, CreatedMixin, IdentityMixin, bounded_json
+
+if TYPE_CHECKING:
+    from .agents import AgentInstance
 
 
 class CapabilityDefinition(IdentityMixin, CreatedMixin, Base):
@@ -26,6 +29,8 @@ class CapabilityDefinition(IdentityMixin, CreatedMixin, Base):
         JSONB, server_default=text("'{}'::jsonb")
     )
 
+    inventories: Mapped[list["InstanceCapability"]] = relationship(viewonly=True, lazy="raise")
+
 
 class InstanceCapability(IdentityMixin, Base):
     __tablename__ = "instance_capabilities"
@@ -41,3 +46,6 @@ class InstanceCapability(IdentityMixin, Base):
     verified_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP")
     )
+
+    instance: Mapped["AgentInstance"] = relationship(viewonly=True, lazy="raise")
+    capability: Mapped["CapabilityDefinition"] = relationship(viewonly=True, lazy="raise")

@@ -1,0 +1,1 @@
+"""Agent and node identities, incarnations, and capability inventory."""

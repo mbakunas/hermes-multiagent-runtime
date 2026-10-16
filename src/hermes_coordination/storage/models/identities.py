@@ -1,11 +1,15 @@
+from typing import TYPE_CHECKING
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import CheckConstraint, ForeignKey, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, CreatedMixin, IdentityMixin, enum_type
 from .enums import PrincipalKind
+
+if TYPE_CHECKING:
+    from .nodes import Node
 
 
 class CoordinationEntity(CreatedMixin, Base):
@@ -31,3 +35,5 @@ class Principal(IdentityMixin, CreatedMixin, Base):
     node_id: Mapped[UUIDValue | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("nodes.id", ondelete="RESTRICT"), index=True
     )
+
+    node: Mapped["Node | None"] = relationship(viewonly=True, lazy="raise")

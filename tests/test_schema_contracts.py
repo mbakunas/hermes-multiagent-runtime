@@ -1,12 +1,15 @@
+from importlib import import_module
 from importlib.util import module_from_spec, spec_from_file_location
 from io import StringIO
 from pathlib import Path
+from shutil import copytree
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import CheckConstraint, DateTime, ForeignKeyConstraint, UniqueConstraint
+from alembic.script import ScriptDirectory
+from sqlalchemy import CheckConstraint, DateTime, ForeignKeyConstraint, UniqueConstraint, inspect, select
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.orm import configure_mappers
+from sqlalchemy.orm import aliased, configure_mappers
 from sqlalchemy.schema import CreateTable
 
 from hermes_coordination.storage.models import Base
@@ -19,10 +22,93 @@ revision = module_from_spec(spec)
 spec.loader.exec_module(revision)
 
 
+def test_architecture_packages_import():
+    packages = (
+        "contracts", "storage", "intake", "registry", "control", "node", "messaging",
+        "proposals", "approvals", "artifacts", "api", "observability", "config", "cli",
+        "adapters", "adapters.hermes_agent",
+    )
+    for package in packages:
+        assert import_module(f"hermes_coordination.{package}") is not None
+
+
 def test_complete_table_catalog_matches_frozen_migration():
     assert len(Base.metadata.tables) == 33
     assert set(Base.metadata.tables) == set(revision.TABLE_COLUMNS) | {"agent_placements"}
     configure_mappers()
+
+
+def test_relationships_compile_for_postgresql():
+    configure_mappers()
+    expected = {
+        "agents": {"instances", "placements"},
+        "nodes": {"instances", "placements"},
+        "agent_instances": {"agent", "node", "capabilities"},
+        "capability_definitions": {"inventories"},
+        "instance_capabilities": {"instance", "capability"},
+        "requests": {"initiator", "concierge", "intent", "workflows"},
+        "workflows": {"request", "tasks"},
+        "tasks": {"workflow", "attempts", "current_attempt", "capabilities", "prerequisites", "dependents"},
+        "task_capabilities": {"task", "capability"},
+        "task_dependencies": {"prerequisite", "dependent"},
+        "assignments": {"task", "instance", "assigner", "attempt"},
+        "task_attempts": {"task", "assignment", "execution_run", "result"},
+        "execution_runs": {"attempt", "profile"},
+        "task_results": {"attempt", "artifact_references"},
+        "work_proposals": {"proposing_agent", "proposing_instance", "originating_task", "originating_attempt"},
+        "proposal_tasks": {"proposal", "task"},
+        "proposal_decisions": {"proposal", "orchestrator"},
+        "artifact_metadata": {"producing_task", "producing_attempt", "uploader", "supersedes"},
+        "approval_policies": {"requests"},
+        "approval_requests": {"task", "attempt", "policy", "requester", "decisions", "effect"},
+        "approval_decisions": {"request", "user"},
+        "effect_intents": {"task", "attempt", "approval"},
+        "task_events": {"task", "actor_principal", "correlation", "causation"},
+        "audit_events": {"entity", "actor_principal", "correlation", "causation"},
+        "outbox_events": {"entity"},
+    }
+    for mapper in Base.registry.mappers:
+        if mapper.local_table.name in expected:
+            assert expected[mapper.local_table.name] <= set(mapper.relationships.keys())
+        for navigation in mapper.relationships:
+            target = aliased(navigation.mapper.class_)
+            statement = select(mapper.class_).join(getattr(mapper.class_, navigation.key).of_type(target))
+            assert str(statement.compile(dialect=postgresql.dialect()))
+            assert "delete" not in navigation.cascade
+            assert "delete-orphan" not in navigation.cascade
+
+
+def test_composite_relationships_preserve_binding_columns():
+    from hermes_coordination.storage.models import (
+        ApprovalRequest, EffectIntent, Task, TaskAttempt, WorkProposal,
+    )
+
+    bindings = (
+        (Task, "current_attempt", {("current_attempt_id", "id"), ("id", "task_id")}),
+        (TaskAttempt, "assignment", {("assignment_id", "id"), ("task_id", "task_id")}),
+        (WorkProposal, "proposing_instance", {("proposing_instance_id", "id"), ("proposing_agent_id", "agent_id")}),
+        (WorkProposal, "originating_attempt", {("originating_attempt_id", "id"), ("originating_task_id", "task_id")}),
+        (ApprovalRequest, "policy", {("policy_id", "id"), ("policy_revision", "revision")}),
+        (EffectIntent, "approval", {("approval_request_id", "id"), ("task_id", "task_id"), ("action_digest", "action_digest")}),
+    )
+    for model, name, expected in bindings:
+        navigation = inspect(model).relationships[name]
+        assert {(local.name, remote.name) for local, remote in navigation.local_remote_pairs} == expected
+        assert navigation.viewonly
+        assert navigation.lazy == "raise"
+
+
+def test_alembic_revision_template_renders(tmp_path):
+    scripts = tmp_path / "migrations"
+    copytree(REVISION_PATH.parents[1], scripts)
+    config = Config(str(scripts / "alembic.ini"))
+    config.set_main_option("script_location", str(scripts))
+    previous_head = ScriptDirectory.from_config(config).get_current_head()
+    generated = command.revision(config, message="Verify revision generation")
+    assert generated is not None
+    assert generated.down_revision == previous_head
+    assert callable(generated.module.upgrade)
+    assert callable(generated.module.downgrade)
 
 
 def test_uuid_server_defaults_and_foreign_keys():
@@ -134,6 +220,7 @@ def test_offline_upgrade_still_emits_complete_sql(monkeypatch):
     assert "hermes_archive_events" in generated
     assert "PARTITION BY RANGE (created_at)" in generated
     assert "agent_placements" in generated
+    assert "hermes_validate_agent_lifecycle" in generated
 
 
 def test_tables_compile_for_postgresql_and_no_blob_columns():

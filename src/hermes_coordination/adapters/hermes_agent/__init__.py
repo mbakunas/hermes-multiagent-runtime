@@ -1,0 +1,1 @@
+"""Version-pinned external Hermes Agent invocation and output mapping."""

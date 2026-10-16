@@ -6,7 +6,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Session
 
 from ..models import Agent, AgentInstance, CapabilityDefinition, InstanceCapability, Node, Principal
-from ..models.enums import InstanceState, ReadinessState
+from ..models.enums import AgentState, InstanceState, ReadinessState
 from .base import Repository
 
 
@@ -30,6 +30,14 @@ class AgentRepository(Repository[Agent]):
 
     def by_name(self, name: str) -> Agent | None:
         return self.session.scalar(select(Agent).where(Agent.name == name))
+
+    def set_desired_state(self, agent_id: UUID, state: AgentState) -> Agent | None:
+        agent = self.get(agent_id)
+        if agent is None:
+            return None
+        agent.desired_state = state
+        self.session.flush()
+        return agent
 
 
 class InstanceRepository(Repository[AgentInstance]):

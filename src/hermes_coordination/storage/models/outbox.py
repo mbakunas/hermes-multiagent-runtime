@@ -1,13 +1,16 @@
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKeyConstraint, Index, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, EventIdentityMixin, bounded_json, enum_type
 from .enums import OutboxPublicationStatus
+
+if TYPE_CHECKING:
+    from .identities import CoordinationEntity
 
 
 class OutboxEvent(EventIdentityMixin, Base):
@@ -43,3 +46,5 @@ class OutboxEvent(EventIdentityMixin, Base):
     publisher_lease: Mapped[UUIDValue | None] = mapped_column(UUID(as_uuid=True))
     publisher_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"))
+
+    entity: Mapped["CoordinationEntity"] = relationship(viewonly=True, lazy="raise")

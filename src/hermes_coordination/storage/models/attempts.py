@@ -1,12 +1,18 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID as UUIDValue
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Index, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, IdentityMixin, TimestampMixin, enum_type
 from .enums import AttemptState
+
+if TYPE_CHECKING:
+    from .assignments import Assignment
+    from .execution import ExecutionRun, TaskResult
+    from .tasks import Task
 
 
 class TaskAttempt(IdentityMixin, TimestampMixin, Base):
@@ -39,3 +45,8 @@ class TaskAttempt(IdentityMixin, TimestampMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_classification: Mapped[str | None] = mapped_column(String(128))
+
+    task: Mapped["Task"] = relationship(foreign_keys=[task_id], viewonly=True, lazy="raise")
+    assignment: Mapped["Assignment"] = relationship(viewonly=True, lazy="raise")
+    execution_run: Mapped["ExecutionRun | None"] = relationship(viewonly=True, lazy="raise")
+    result: Mapped["TaskResult | None"] = relationship(viewonly=True, lazy="raise")
